@@ -22,6 +22,17 @@ Changes from policy.py, each behind a flag so it can be measured on its own:
   the contact's window aborts; one still on the ground never takes off. Aircraft held on the
   ground for minutes then took off into airspace nobody predicted them in.
 - Take-off check: a lower-id peer (which may move any way) is assumed able to take off now.
+- LAG_REFRESH_S (loop 2): an off-plan aircraft whose real position is more than LAG_M from the
+  plan's position re-announces every LAG_REFRESH_S seconds instead of REFRESH_S. Peers that
+  never heard it place it there, and the 8 s refresh was often sent while they were out of range.
+- HOVER_ABORT (loop 3): an aborted aircraft hovers where it is and moves only when hovering
+  would break separation. Flying the route backwards met outbound traffic head-on and ended in
+  the busy base (most loop 2 failures involved a returning aircraft).
+- QUIET_HOVER_M (loop 4): a hovering aircraft keeps the fast refresh only while a peer is
+  believed within this distance (hover repeats were 63 % of all messages in loop 3).
+- RETURN_LAST (loop 5, off: 9 -> 13 failed runs): a drone that has not aborted reverses to avoid a peer only when no
+  forward or hold move keeps d_sep + RETURN_FLOOR_M and reversing gains RETURN_GAIN_M more room.
+  Reversals were in 8 of the 11 colliding pairs in loop 4, often heard too late by the peer.
 - RELAY: an effector that heard its target's confirmation repeats it shortly before its own
   engagement, so strike partners close behind it hear it too.
 - O_DENSE_S / O_GAP_S: a scout repeats an "observed" notice every second for O_DENSE_S, then
@@ -63,6 +74,13 @@ SEP_MARGIN_M = 15.0
 NEAR_M = 400.0
 REPEAT_S = 4.0
 REFRESH_S = 8.0
+LAG_REFRESH_S = 3.0     # loop 2: refresh this often while far from where the plan puts us
+LAG_M = 60.0            # "far": real position this far from the plan's position at the real time
+HOVER_ABORT = True      # loop 3: an aborted aircraft hovers instead of retracing its route
+QUIET_HOVER_M = 800.0   # loop 4: a hovering aircraft keeps the fast refresh only with a peer this close
+RETURN_LAST = False     # loop 5 (measured worse, off): a drone that has not aborted reverses only as a last resort
+RETURN_FLOOR_M = 5.0    # reverse only when every forward or hold move keeps less than d_sep + this
+RETURN_GAIN_M = 10.0    # and reversing keeps at least this much more room
 EXEMPT_MARGIN_M = 25.0
 SLACK_S = 1.5
 NEWS_SENDS = 0
@@ -161,6 +179,7 @@ class Policy:
         self.route = routes[aircraft_id]
         self.clock = RouteClock(self.route)
         self.sep = rules.d_sep_m + SEP_MARGIN_M
+        self.d_sep = rules.d_sep_m
         self.exempt = rules.exempt_radius_m - EXEMPT_MARGIN_M
         self.contacts = scenario.contact_by_id()
         self.contact_ids = [c.id for c in scenario.contacts]
@@ -363,6 +382,10 @@ class Policy:
         if self.aborted:
             if PARK and self.target is not None and self.ac.type == EFFECTOR and self._near_target(tau):
                 return [0.0, -1.0], False       # parked inside the exemption: stay out of the way
+            if HOVER_ABORT:
+                if tau <= self.clock.start + 1e-9:
+                    return [-1.0], False            # still on its pad: stay down
+                return [0.0, -1.0, 0.5, 1.0], False
             return [-1.0, 0.0, 0.5, 1.0], False
         if self.target is not None and self.target in self.confirmed:
             if t + (self.engage_t - tau) < self.confirmed[self.target] + self.margin:
@@ -404,17 +427,34 @@ class Policy:
             self.zone_stuck_since = None
         options = allowed or [0.0]
         choice, best_room = options[0], -1.0
+        rooms = {}
         for r in options:
-            room = self._room(t, tau, r)
+            room = rooms[r] = self._room(t, tau, r)
             if room >= self.sep:
                 choice = r
                 break
             if room > best_room:
                 choice, best_room = r, room
+        if (RETURN_LAST and choice == -1.0 and not self.aborted and rooms.get(-1.0, 0.0) < self.sep):
+            ahead = {r: rooms.get(r, self._room(t, tau, r)) for r in options if r >= 0.0}
+            if ahead:
+                r_best = max(ahead, key=ahead.get)
+                if ahead[r_best] >= self.d_sep + RETURN_FLOOR_M or rooms[-1.0] < ahead[r_best] + RETURN_GAIN_M:
+                    choice = r_best             # a hold or a slow-down surprises peers less than reversing
         self.rate = choice
         action = ({"kind": "continue"} if choice == 1.0 else {"kind": "hold"} if choice == 0.0
                   else {"kind": "return"} if choice == -1.0 else {"kind": "speed", "scale": choice})
         return action, self._message(obs, tau, choice)
+
+    def _peer_within(self, t, tau, radius):
+        here = self.clock.position(tau)
+        for aid in self.peers:
+            p = self._peer_pos(aid, t)
+            if p is None and self._takes_off_soon(aid, t):
+                p = self.peers[aid][0].pos[0]
+            if p is not None and _d(p, here) <= radius:
+                return True
+        return False
 
     def _close_peers(self, t, tau):
         here = self.clock.position(tau)
@@ -445,7 +485,14 @@ class Policy:
             records.append(("O", self.contact_index[self.target], self.confirmed[self.target]))
         changed = self.sent is None and rate != 1.0 or self.sent is not None and rate != self.sent[0]
         off = abs(tau - t) > 0.25 or rate != 1.0
-        due = self.sent is not None and off and t - self.last_sent >= (REPEAT_S if self.repeats < 1 else REFRESH_S)
+        refresh = REFRESH_S
+        if LAG_REFRESH_S > 0 and off and tau > self.clock.start + 1e-9:   # not while still on the ground
+            planned = None if t >= self.clock.end else self.clock.position(max(t, self.clock.start))
+            if planned is None or _d(planned, self.clock.position(tau)) > LAG_M:
+                refresh = LAG_REFRESH_S      # peers that never heard us place us far from here
+                if QUIET_HOVER_M > 0 and rate == 0.0 and not self._peer_within(t, tau, QUIET_HOVER_M):
+                    refresh = REFRESH_S      # hovering with nobody around: the slow refresh is enough
+        due = self.sent is not None and off and t - self.last_sent >= (REPEAT_S if self.repeats < 1 else refresh)
         close = set()
         if RESEND_NEAR_M > 0 and self.sent is not None and off:
             close = self._close_peers(t, tau)
