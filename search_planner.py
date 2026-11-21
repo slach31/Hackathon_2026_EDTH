@@ -574,7 +574,7 @@ class WarmPlanner(_Planner):
 class Search:
     def __init__(self, scenario, seconds=55.0, top_n=5, beam_width=6, start=None, lns_share=0.4,
                  interleave=False, adaptive=False, restarts=True, widen=False,
-                 scout_speed="fast", obs_stretch=True):
+                 scout_speed="fast", obs_stretch=True, variant=0):
         if seconds < 0 or not 1 <= top_n <= 100 or not 1 <= beam_width <= 100:
             raise ValueError("seconds must be nonnegative; top_n and beam_width must be 1..100")
         if not 0 <= lns_share <= 1:
@@ -603,7 +603,11 @@ class Search:
         if interleave:
             # Beam passes alternate with LNS bursts; a short final tail is LNS only.
             self.beam_stop = self.stop - min(lns_share, 0.1) * max(0.0, self.stop - self.start)
-        self.lns_rng = random.Random(scenario.seed + 7919)
+        # variant > 0: a parallel worker. It skips the deterministic warm start (the main
+        # process runs it), starts the pass-order cycle elsewhere and draws other random
+        # orders and LNS moves, so workers grow different subtrees of the same root.
+        self.variant = variant
+        self.lns_rng = random.Random(scenario.seed + 7919 + 104729 * variant)
         self.lns_state = None
         self.weights = {op: 1.0 for op in DESTROY_OPERATORS}
         self.root = State({}, {a.id: [] for a in scenario.aircraft if a.type == SCOUT},
@@ -939,11 +943,12 @@ class Search:
         while contacts:
             self.checker.check_time()
             # Different orders explore different scout tours and allocations.
-            if self.passes % 4 == 0:
+            kind = (self.passes + self.variant) % 4
+            if kind == 0:
                 order = sorted(contacts, key=lambda c: (-priorities[c.id], c.id))
-            elif self.passes % 4 == 1:
+            elif kind == 1:
                 order = sorted(contacts, key=lambda c: (c.window[1], -priorities[c.id], c.id))
-            elif self.passes % 4 == 2:
+            elif kind == 2:
                 order = sorted(contacts, key=lambda c: (-c.points, c.id))
             else:
                 noise = {c.id: rng.uniform(0.65, 1.35) for c in contacts}
@@ -989,15 +994,16 @@ class Search:
     def search_phase(self):
         """Warm start plus beam passes until the beam deadline.
         Returns the searchable contacts and their priorities."""
-        try:
-            self.warm_start()
-        except DeadlineReached:
-            pass
+        if self.variant == 0:
+            try:
+                self.warm_start()
+            except DeadlineReached:
+                pass
         self.matrix = CandidateMatrix(self.sc)
         contacts = [c for c in self.sc.contacts if c.cls in (HOSTILE, UNKNOWN)
                     and c.window is not None and c.id not in self.matrix.banned]
         priorities = {c.id: self.matrix.priority(c) for c in contacts}
-        rng = random.Random(self.sc.seed)
+        rng = random.Random(self.sc.seed + 1009 * self.variant)
         self.checker.stop = min(self.beam_stop, self.stop)
         try:
             self.search(contacts, priorities, rng)
@@ -1227,5 +1233,123 @@ class Search:
                 "unserved_points": diagnostics["unserved_points"],
                 "contacts": diagnostics["contacts"],
                 "solutions": [{"rank": i, "node": state.node_id, "score": result.score,
-                               "served": result.served} for i, (state, result) in enumerate(verified, 1)],
+                               "served": result.served,
+                               **({"worker": state.variant} if isinstance(state, ImportedPlan) else {})}
+                              for i, (state, result) in enumerate(verified, 1)],
+                **({"parallel": self.parallel} if getattr(self, "parallel", None) else {}),
                 "nodes": self.trace}
+
+# Parallel search. Worker processes run independent Search variants (their own beam passes
+# from the same root and their own LNS chains) and send back their validated top plans. The
+# main process runs the ordinary search, so workers=1 is exactly the single-core planner.
+
+WORKER_MARGIN_S = 1.5    # workers stop this much earlier, so their plans arrive in time
+WORKER_IMPORTS = 3       # worker plans the main process will re-validate at most
+MAX_WORKERS = 16
+
+
+def default_workers():
+    """One process per spare core, keeping a core for the system; at most 5."""
+    import os
+    try:
+        cores = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cores = os.cpu_count() or 1
+    return max(1, min(5, cores - 1))
+
+
+class ImportedPlan:
+    """A plan found by worker `variant`; the main process validates it again before export."""
+    node_id = None
+
+    def __init__(self, plan, variant):
+        self._plan, self.variant = plan, variant
+
+    def plan(self, seed):
+        return self._plan
+
+
+def _worker(scenario, kwargs, variant, conn):
+    try:
+        search = Search(scenario, variant=variant, **kwargs)
+        verified = search.run()
+        conn.send({"variant": variant, "elapsed_s": time.monotonic() - search.start,
+                   "passes": search.passes, "lns": dict(search.lns),
+                   "candidate_checks": search.checker.calls,
+                   "plans": [(state.plan(scenario.seed), result.score) for state, result in verified]})
+    except BaseException as exc:  # Report, never hang the main process.
+        try:
+            conn.send({"variant": variant, "error": repr(exc)})
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+def run_parallel(scenario, workers=1, **kwargs):
+    """Search.run() on `workers` processes; returns (main search, verified plans).
+
+    Every candidate the main process exports passed its own official evaluate() call. Worker
+    failures, late workers or an unavailable multiprocessing module fall back to the main
+    process's result.
+    """
+    search = Search(scenario, **kwargs)
+    if workers <= 1:
+        return search, search.run()
+    try:
+        import multiprocessing as mp
+        ctx = mp.get_context("fork" if "fork" in mp.get_all_start_methods() else "spawn")
+    except (ImportError, ValueError):
+        return search, search.run()
+    budget = max(0.0, search.stop - search.start - WORKER_MARGIN_S)
+    worker_kwargs = dict(kwargs, start=search.start, seconds=budget)
+    procs = []
+    for variant in range(1, min(workers, MAX_WORKERS)):
+        try:
+            recv, send = ctx.Pipe(duplex=False)
+            proc = ctx.Process(target=_worker, args=(scenario, worker_kwargs, variant, send),
+                               daemon=True)
+            proc.start()
+        except (OSError, RuntimeError):
+            break
+        send.close()
+        procs.append((proc, recv))
+    try:
+        verified = search.run()
+        reports = []
+        collect_until = min(search.start + 57.0, max(time.monotonic(), search.stop) + 1.0)
+        for proc, recv in procs:
+            try:
+                if recv.poll(max(0.0, collect_until - time.monotonic())):
+                    reports.append(recv.recv())
+            except (EOFError, OSError):
+                pass
+        best = verified[0][1].score
+        candidates = sorted(((score, plan, r["variant"]) for r in reports
+                             for plan, score in r.get("plans", ()) if score > best + 1e-9),
+                            key=lambda item: -item[0])
+        imported = []
+        for _, plan, variant in candidates[:WORKER_IMPORTS]:
+            if time.monotonic() >= search.start + 58.0:
+                break
+            result = evaluate(scenario, plan)
+            if result.valid:
+                imported.append((ImportedPlan(plan, variant), result))
+                break
+        verified = sorted(imported + verified, key=lambda pair: -pair[1].score)
+        winner = verified[0][0]
+        search.parallel = {
+            "workers": 1 + len(procs), "requested_workers": workers,
+            "winner": winner.variant if isinstance(winner, ImportedPlan) else 0,
+            "main_score": best,
+            "reports": [{k: v for k, v in r.items() if k != "plans"}
+                        | {"best": max((score for _, score in r.get("plans", ())), default=None)}
+                        for r in reports],
+            "missing": len(procs) - len(reports)}
+        return search, verified
+    finally:
+        for proc, recv in procs:
+            if proc.is_alive():
+                proc.terminate()
+            proc.join(0.2)
+            recv.close()

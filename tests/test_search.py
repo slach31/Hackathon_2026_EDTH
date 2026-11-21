@@ -229,7 +229,8 @@ class SearchTests(unittest.TestCase):
             env = dict(os.environ, PYTHONPATH=str(Path(fleetkit.__file__).resolve().parent.parent))
             start = time.monotonic()
             result = subprocess.run([sys.executable, 'planner.py', 'scenario.json', 'plan.json',
-                                     '--seconds', '.5', '--top-n', '3', '--artifacts', 'artifacts'],
+                                     '--seconds', '.5', '--top-n', '3', '--artifacts', 'artifacts',
+                                     '--workers', '2'],
                                     cwd=work, env=env, timeout=5, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertLess(time.monotonic()-start, 5)
@@ -497,6 +498,55 @@ class PadTimingTests(unittest.TestCase):
         sc = Scenario.from_dict(generate('L3', 2))
         for state, result in Search(sc, seconds=4.0).run():
             self.assertTrue(evaluate(sc, state.plan(sc.seed)).valid)
+
+
+class ParallelTests(unittest.TestCase):
+    def test_one_worker_is_the_plain_search(self):
+        sc = Scenario.from_dict(generate('L2', 3))
+        search, verified = search_planner.run_parallel(sc, 1, seconds=1.0)
+        self.assertIsInstance(search, Search)
+        self.assertFalse(hasattr(search, 'parallel'))
+        self.assertNotIsInstance(verified[0][0], search_planner.ImportedPlan)
+        self.assertTrue(evaluate(sc, verified[0][0].plan(sc.seed)).valid)
+
+    def test_workers_return_a_valid_best_plan_in_time(self):
+        sc = Scenario.from_dict(generate('L3', 2))
+        start = time.monotonic()
+        search, verified = search_planner.run_parallel(sc, 3, seconds=3.0, start=start)
+        self.assertLess(time.monotonic() - start, 6.0)
+        info = search.parallel
+        self.assertEqual(info['workers'], 3)
+        self.assertEqual(info['missing'], 0)
+        self.assertEqual({r['variant'] for r in info['reports']}, {1, 2})
+        self.assertTrue(all('error' not in r for r in info['reports']))
+        result = evaluate(sc, verified[0][0].plan(sc.seed))
+        self.assertTrue(result.valid)
+        self.assertAlmostEqual(result.score, verified[0][1].score)
+        self.assertGreaterEqual(verified[0][1].score, info['main_score'] - 1e-9)
+        self.assertEqual(info['winner'], getattr(verified[0][0], 'variant', 0))
+
+    def test_failed_worker_falls_back_to_main_result(self):
+        sc = Scenario.from_dict(generate('L1', 4))
+        original = search_planner.Search.run
+
+        def run(self):
+            if self.variant:
+                raise RuntimeError('worker broke')
+            return original(self)
+
+        search_planner.Search.run = run
+        try:
+            search, verified = search_planner.run_parallel(sc, 2, seconds=1.0)
+        finally:
+            search_planner.Search.run = original
+        self.assertIn('worker broke', search.parallel['reports'][0]['error'])
+        self.assertEqual(search.parallel['winner'], 0)
+        self.assertTrue(evaluate(sc, verified[0][0].plan(sc.seed)).valid)
+
+    def test_variants_explore_different_orders(self):
+        sc = Scenario.from_dict(generate('L2', 5))
+        main, worker = Search(sc, seconds=0), Search(sc, seconds=0, variant=1)
+        self.assertNotEqual(main.lns_rng.random(), worker.lns_rng.random())
 
 
 if __name__ == '__main__':

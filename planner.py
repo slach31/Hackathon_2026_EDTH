@@ -27,7 +27,7 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(kits[0].parent.parent))
 
 from fleetkit.model import Scenario, load_json, save_json
-from search_planner import Search
+from search_planner import MAX_WORKERS, default_workers, run_parallel
 
 
 def main():
@@ -56,6 +56,9 @@ def main():
     parser.add_argument("--obs-stretch", action=argparse.BooleanOptionalAction, default=True,
                         help="observe from as far as the 3D range allows at the scout's altitude "
                              "(~125 m at 70 m) instead of the kit's 100 m (default: on)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="search processes; 1 = single core (default), 0 = one per spare core "
+                             "(at most 5)")
     parser.add_argument("--artifacts", type=Path,
                         help="optional directory for ranked plans, tree.json and interactive tree.html")
     args = parser.parse_args()
@@ -63,11 +66,14 @@ def main():
         parser.error("seconds must be 0..55; top-n and beam-width must be 1..100")
     if not 0 <= args.lns_share <= 1:
         parser.error("lns-share must be 0..1")
+    if not 0 <= args.workers <= MAX_WORKERS:
+        parser.error(f"workers must be 0..{MAX_WORKERS}")
+    workers = args.workers or default_workers()
     scenario = Scenario.from_dict(load_json(args.scenario))
-    search = Search(scenario, args.seconds, args.top_n, args.beam_width, START, args.lns_share,
-                    args.interleave, args.adaptive, args.restarts,
-                    scout_speed=args.scout_speed, obs_stretch=args.obs_stretch)
-    verified = search.run()
+    search, verified = run_parallel(
+        scenario, workers, seconds=args.seconds, top_n=args.top_n, beam_width=args.beam_width,
+        start=START, lns_share=args.lns_share, interleave=args.interleave, adaptive=args.adaptive,
+        restarts=args.restarts, scout_speed=args.scout_speed, obs_stretch=args.obs_stretch)
     # Required output is written before optional diagnostics.
     save_json(verified[0][0].plan(scenario.seed), args.plan)
     report = search.report(verified)
@@ -80,7 +86,7 @@ def main():
         save_tree(report, args.artifacts / "tree.html")
     print(json.dumps({key: report[key] for key in
                       ("elapsed_s", "passes", "lns", "candidate_checks", "rejections",
-                       "unserved", "unserved_points", "contacts", "solutions") if key in report}), file=sys.stderr)
+                       "unserved", "unserved_points", "contacts", "solutions", "parallel") if key in report}), file=sys.stderr)
 
 
 if __name__ == "__main__":
