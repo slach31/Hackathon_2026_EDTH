@@ -499,5 +499,25 @@ class PadTimingTests(unittest.TestCase):
             self.assertTrue(evaluate(sc, state.plan(sc.seed)).valid)
 
 
+class DiverseBeamTests(unittest.TestCase):
+    def test_reserved_slots_keep_novel_branches(self):
+        search = Search(scenario(), seconds=0, beam_width=3, diverse=1)
+        make = lambda served, score: replace(search.root, served=frozenset(served), score=score)
+        ranked = [make('AB', 9), make('A', 8), make('AB', 7), make('C', 1)]
+        self.assertEqual([s.score for s in search.select(ranked, 3)], [9, 8, 1])
+        search.diverse = 0
+        self.assertEqual([s.score for s in search.select(ranked, 3)], [9, 8, 7])
+
+    def test_reserved_slots_fall_back_to_best_rest(self):
+        search = Search(scenario(), seconds=0, beam_width=3, diverse=2)
+        make = lambda served, score: replace(search.root, served=frozenset(served), score=score)
+        ranked = [make('AB', 9), make('A', 8), make('B', 7), make('AB', 6)]
+        self.assertEqual([s.score for s in search.select(ranked, 3)], [9, 8, 7])
+
+    def test_diverse_must_leave_a_ranked_slot(self):
+        with self.assertRaises(ValueError):
+            Search(scenario(), seconds=0, beam_width=3, diverse=3)
+
+
 if __name__ == '__main__':
     unittest.main()

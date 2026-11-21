@@ -574,11 +574,15 @@ class WarmPlanner(_Planner):
 class Search:
     def __init__(self, scenario, seconds=55.0, top_n=5, beam_width=6, start=None, lns_share=0.4,
                  interleave=False, adaptive=False, restarts=True, widen=False,
-                 scout_speed="fast", obs_stretch=True):
+                 scout_speed="fast", obs_stretch=True, diverse=0):
         if seconds < 0 or not 1 <= top_n <= 100 or not 1 <= beam_width <= 100:
             raise ValueError("seconds must be nonnegative; top_n and beam_width must be 1..100")
         if not 0 <= lns_share <= 1:
             raise ValueError("lns_share must be 0..1")
+        if not 0 <= diverse < beam_width:
+            raise ValueError("diverse must be 0..beam_width-1")
+        # Beam slots reserved for lower-ranked branches serving a contact no kept branch serves.
+        self.diverse = diverse
         if scout_speed not in SCOUT_SPEEDS:
             raise ValueError(f"scout_speed must be one of {SCOUT_SPEEDS}")
         # Scout tour settings are module-wide (tour cache and helpers); one Search per run.
@@ -933,6 +937,28 @@ class Search:
                     improved = True
         return state
 
+    def select(self, ranked, width):
+        """The next beam from score-ranked unique nodes: the top width - diverse, then the
+        best remaining nodes that serve a contact none of the kept nodes serves, then the
+        best of the rest. diverse=0 is the plain top-width beam."""
+        if not self.diverse or len(ranked) <= width:
+            return ranked[:width]
+        beam = ranked[:width - self.diverse]
+        covered = set().union(*(s.served for s in beam))
+        rest = ranked[width - self.diverse:]
+        for state in rest:
+            if len(beam) >= width:
+                break
+            if state.served - covered:
+                beam.append(state)
+                covered |= state.served
+        for state in rest:
+            if len(beam) >= width:
+                break
+            if not any(state is kept for kept in beam):
+                beam.append(state)
+        return beam
+
     def search(self, contacts, priorities, rng):
         """Beam passes over varied contact orders until the checker deadline.
         Returns False once the trace cap is reached."""
@@ -971,7 +997,7 @@ class Search:
                 width = self.width
                 if self.widen and self.passes >= 4:
                     width = min(100, self.width + self.width // 2)
-                beam = list(unique.values())[:width]
+                beam = self.select(list(unique.values()), width)
             self.passes += 1
             if self.interleave and self.lns_share < 1:
                 burst = (time.monotonic() - pass_start) * self.lns_share / (1 - self.lns_share)
@@ -1217,7 +1243,7 @@ class Search:
                 "candidate_checks": self.checker.calls,
                 "candidate_check_seconds": self.checker.seconds,
                 "rejections": self.checker.rejections,
-                "beam_width": self.width, "requested_top_n": self.top_n,
+                "beam_width": self.width, "diverse": self.diverse, "requested_top_n": self.top_n,
                 "scouting": {"scout_speed": self.scout_speed, "obs_stretch": self.obs_stretch},
                 "lns": {**self.lns, "variant": {"interleave": self.interleave,
                                                 "adaptive": self.adaptive,
