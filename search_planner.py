@@ -304,6 +304,20 @@ def obs_offset(scenario, contact, z):
     return max(baseline.OBS_OFFSET_M, math.sqrt(reach * reach - dz * dz))
 
 
+# Observation angle for hostiles (off: None). Angle 0 puts the observation point on the line
+# from the contact toward the scout's home; every aircraft shares one base, so that is the
+# line the strike flies in on, seconds after the observation ends. With OBS_SIDE_ANGLE = A,
+# hostiles are observed from A degrees off that line (A, then -A, then 0 are tried).
+OBS_SIDE_ANGLE = None
+
+
+def obs_angles(contact):
+    """Observation angles to try for a contact, preferred first."""
+    if OBS_SIDE_ANGLE is not None and contact.cls == HOSTILE:
+        return (float(OBS_SIDE_ANGLE), -float(OBS_SIDE_ANGLE), 0.0)
+    return (0.0, 60.0, -60.0)
+
+
 def obs_point(scenario, scout, contact, angle, z):
     ux, uy = baseline._toward_home(contact, scout.home, angle)
     off = obs_offset(scenario, contact, z)
@@ -914,6 +928,14 @@ TRIP_TREE_DIVERSE = False
 # Width schedule (None: TRIP_TREE_WIDTH at every depth): (start, end) beam widths, falling
 # linearly from the first scout to the last. The first scouts' choices decide most.
 TRIP_TREE_SCHEDULE = None
+# Lookahead (off): a child's key uses the next scout re-planned from the child's own plan
+# (label search over the contacts still free, team costs from the effectors not yet used:
+# all its possible trips) instead of the pregenerated-trip estimate for that scout.
+# TRIP_TREE_LOOKAHEAD_STRIKES: a hostile in a lookahead trip counts only if its cheapest
+# team's first route, timed from the predicted observation, clears the child's scouts (R8).
+TRIP_TREE_LOOKAHEAD = False
+TRIP_TREE_LOOKAHEAD_STRIKES = True
+TRIP_TREE_LOOKAHEAD_TOP = 5
 # Total trip realisations for the tree instead of the time share per depth (None: time).
 # For deterministic comparisons; each depth gets an equal share of what is left.
 TRIP_TREE_NODE_BUDGET = None
@@ -1134,6 +1156,64 @@ def route_key(route):
                   w.get("target")) for w in route)
 
 
+# Check pairs with aircraft from recent R8 violations first (same verdicts, faster rejects).
+R8_HOT_FIRST = True
+# Fast exact clearance pre-check for R8 pairs (FAST_R8): one tight loop over the pieces of two
+# routes, minimum distance of the relative linear motion per overlapping piece pair, with a
+# looser limit (d_sep + 1 mm) than the kit's (d_sep - EPS). "Clear" there means the kit finds
+# no violation either; anything else (and same-target pairs) goes to the kit's check.
+FAST_R8 = True
+FAST_R8_SLACK_M = 1e-3
+
+
+def fast_pieces(pieces):
+    """(t0, t1, x0, y0, z0, vx, vy, vz) per kit piece (t0, t1, p0, p1)."""
+    out = []
+    for t0, t1, p0, p1 in pieces:
+        dt = t1 - t0
+        if dt <= 1e-12:
+            v = (0.0, 0.0, 0.0)
+        else:
+            k = 1.0 / dt
+            v = ((p1[0] - p0[0]) * k, (p1[1] - p0[1]) * k, (p1[2] - p0[2]) * k)
+        out.append((t0, t1, p0[0], p0[1], p0[2], v[0], v[1], v[2]))
+    return out
+
+
+def fast_clear(fa, fb, d):
+    """True when no overlapping piece pair of the two routes comes within d."""
+    d2 = d * d
+    i = j = 0
+    na, nb = len(fa), len(fb)
+    while i < na and j < nb:
+        a, b = fa[i], fb[j]
+        lo = a[0] if a[0] > b[0] else b[0]
+        hi = a[1] if a[1] < b[1] else b[1]
+        if hi - lo > 1e-12:
+            ta, tb = lo - a[0], lo - b[0]
+            rx = b[2] + b[5] * tb - a[2] - a[5] * ta
+            ry = b[3] + b[6] * tb - a[3] - a[6] * ta
+            rz = b[4] + b[7] * tb - a[4] - a[7] * ta
+            wx, wy, wz = b[5] - a[5], b[6] - a[6], b[7] - a[7]
+            qc = rx * rx + ry * ry + rz * rz - d2
+            if qc < 0.0:
+                return False
+            qa = wx * wx + wy * wy + wz * wz
+            if qa > 1e-12:
+                qb = 2.0 * (rx * wx + ry * wy + rz * wz)
+                length = hi - lo
+                t = -qb / (2.0 * qa)
+                if t > length:
+                    t = length
+                if t > 0.0 and qa * t * t + qb * t + qc < 0.0:
+                    return False
+        if a[1] < b[1]:
+            i += 1
+        else:
+            j += 1
+    return True
+
+
 class IncrementalValidator:
     """Reuse valid unchanged routes, including their cached R8 flight pieces.
 
@@ -1157,6 +1237,9 @@ class IncrementalValidator:
         # route with ~100 strike variants, and passes rebuild the same routes.
         self._routes = {}   # (aid, route_key) -> (rid, Route, violations, item, energy)
         self._pairs = {}    # (rid, rid) -> R8 violation or None
+        self._hot = {}      # aircraft id -> clock of its latest R8 violation (R8_HOT_FIRST)
+        self._fast = {}     # rid -> fast_pieces (FAST_R8)
+        self._hot_clock = 0
         self.cache_hits = 0
 
     def route_info(self, aid, waypoints, key=None):
@@ -1168,6 +1251,7 @@ class IncrementalValidator:
         if len(self._routes) > 200000:
             self._routes.clear()
             self._pairs.clear()
+            self._fast.clear()
         plan = {"seed": self.sc.seed, "routes": [{"aircraft": aid, "waypoints": waypoints}]}
         changed, errors = parse_plan(plan)
         if errors or changed is None:
@@ -1251,12 +1335,25 @@ class IncrementalValidator:
             return self._pairs[key]
         if a[1] is None or b[1] is None or self.apart(a[1], b[1]):
             violation = None
+        elif (FAST_R8 and (a[1][4] is None or a[1][4] != b[1][4])
+              and fast_clear(self.fast_item(a), self.fast_item(b),
+                             self.sc.rules.d_sep_m + FAST_R8_SLACK_M)):
+            violation = None
         else:
             violation = rules.separation_violation(self.sc.rules, self.contacts, a[1][:5], b[1][:5])
         if len(self._pairs) > 2000000:
             self._pairs.clear()
         self._pairs[key] = violation
         return violation
+
+    def fast_item(self, x):
+        """fast_pieces of an (rid, item) pair, cached per route id."""
+        hit = self._fast.get(x[0])
+        if hit is None:
+            if len(self._fast) > 200000:
+                self._fast.clear()
+            hit = self._fast[x[0]] = fast_pieces(x[1][1])
+        return hit
 
     def check_time(self, stop=None):
         if time.monotonic() >= min(self.stop, stop if stop is not None else self.stop):
@@ -1335,6 +1432,11 @@ class IncrementalValidator:
             info = parent.infos.get(aid)
             # Parent routes normally come through here; otherwise check without the memo.
             old.append((info[0], item) if info is not None and info[3] is item else (-1, item))
+        if R8_HOT_FIRST and self._hot:
+            # Aircraft in recent R8 violations first: a rejection is found after a few pair
+            # checks instead of ~84 on average. Same verdict (any violation rejects).
+            hot = self._hot
+            old.sort(key=lambda o: -hot.get(o[1][0], 0) if o[1] is not None else 0)
         for a, b in itertools.chain(itertools.combinations(new, 2), itertools.product(new, old)):
             self.check_time()
             if a[0] < 0 or b[0] < 0:
@@ -1344,6 +1446,11 @@ class IncrementalValidator:
             else:
                 violation = self.pair_violation(a, b)
             if violation:
+                if R8_HOT_FIRST:
+                    self._hot_clock += 1
+                    for x in (a, b):
+                        if x[1] is not None:
+                            self._hot[x[1][0]] = self._hot_clock
                 return self.reject([violation])
         new_items = {aid: info[3] for aid, info in infos.items()}
         old_items = {aid: item for aid, item in parent.separation.items() if aid not in changed}
@@ -1618,7 +1725,7 @@ class Search:
                 pos = order.index(contact.id)
                 fits = {z: not TIME_RANK or tour_fits(self.sc, scout, current, contact, order, z,
                                                       deadlines) for z in SCOUT_LAYERS}
-                for z, obs_angle, shift in itertools.product(SCOUT_LAYERS, (0.0, 60.0, -60.0),
+                for z, obs_angle, shift in itertools.product(SCOUT_LAYERS, obs_angles(contact),
                                                              (0.0, 7.0)):
                     if not fits[z]:
                         yield scout, None, None
@@ -2142,7 +2249,7 @@ class Search:
             else:
                 net = c.points
             latest = min(latest, deadlines.get(c.id, math.inf))
-            point = obs_point(self.sc, scout, c, 0.0, z)
+            point = obs_point(self.sc, scout, c, obs_angles(c)[0], z)
             if net > 0:
                 net *= self.visit_keep(scout.id, c.id, point, z)
             if net <= 0 or latest < lo + rules_.obs_dwell_s:
@@ -2304,7 +2411,7 @@ class Search:
         speed = eco_speed(scout) if SCOUT_SPEED_MODE != "fast" else fast_speed(scout)
 
         def options():
-            for zz, angle, sh in itertools.product(layers, (0.0, 60.0, -60.0), (0.0, 7.0)):
+            for zz, angle, sh in itertools.product(layers, obs_angles(contact), (0.0, 7.0)):
                 task = {"cid": cid, "point": obs_point(self.sc, scout, contact, angle, zz),
                         "window": contact.window, "cpos": contact.pos}
                 tt = tasks + [task]
@@ -2504,6 +2611,17 @@ class Search:
                         break
             return ratio * total
 
+        def tree_key(state, taken, d):
+            """Real score + (next scout re-planned from this plan, if TRIP_TREE_LOOKAHEAD)
+            + estimate for the scouts after that."""
+            if TRIP_TREE_LOOKAHEAD and d + 1 < len(order):
+                t0 = time.monotonic()
+                value, held = self.lookahead_value(state, self.aircraft[order[d + 1]], taken)
+                stats["lookahead_s"] = stats.get("lookahead_s", 0.0) + time.monotonic() - t0
+                stats["lookaheads"] = stats.get("lookaheads", 0) + 1
+                return state.score + ratio * value + rest_value(d + 2, taken | held)
+            return state.score + rest_value(d + 1, taken)
+
         beam = [(self.root, frozenset())]
         best = None
         seen = set()
@@ -2526,7 +2644,7 @@ class Search:
                     if mine is not None and mine not in options and not mine[2] & taken:
                         options.append(mine)
                     # "No trip": the scout stays home and its contacts stay free.
-                    children.append((state.score + rest_value(d + 1, taken), state, taken))
+                    children.append((tree_key(state, taken, d), state, taken))
                     queues.append((state, taken, options))
                 width = max((len(q[2]) for q in queues), default=0)
                 tried = 0
@@ -2559,8 +2677,7 @@ class Search:
                                             depth0 + d + 1)
                         new_taken = taken | frozenset(done)
                         errors.append(options[k][0] - (child.score - state.score))
-                        children.append((child.score + rest_value(d + 1, new_taken), child,
-                                         new_taken))
+                        children.append((tree_key(child, new_taken, d), child, new_taken))
                         if best is None or child.score > best.score:
                             best = child
                     if tried and over():
@@ -2600,6 +2717,8 @@ class Search:
         for state, _ in beam:
             if best is None or state.score > best.score:
                 best = state
+        if "lookahead_s" in stats:
+            stats["lookahead_s"] = round(stats["lookahead_s"], 3)
         if errors:
             stats["estimate_error"] = {"mean": round(statistics.fmean(errors), 2),
                                        "stdev": round(statistics.pstdev(errors), 2)}
@@ -2607,6 +2726,55 @@ class Search:
                      score=round(best.score, 3) if best is not None else None)
         self.trip_stats["tree"] = stats
         return best
+
+    def lookahead_value(self, state, scout, taken):
+        """(value, contacts) of the scout's best trip re-planned from `state`: label search
+        over contacts neither taken nor served, with team costs from unused effectors; a
+        hostile whose strike would clash with the plan's scouts is not counted."""
+        rules_ = self.sc.rules
+        exclude = set(taken) | set(state.served)
+        scouts = [(info[0], info[3]) for aid, info in state.infos.items()
+                  if self.aircraft[aid].type == SCOUT and info[3] is not None]
+        best = (0.0, frozenset())
+        for z in tuple(dict.fromkeys((SCOUT_LAYERS[0], min(SCOUT_LAYERS)))):
+            cands = self.trip_candidates(scout, state.used, exclude, z)
+            if not cands:
+                continue
+            net = {c[0]: c[3] for c in cands}
+            for value, trip, _, finishes in trip_labels(
+                    self.sc, scout, cands, z, keep=TRIP_PLAN_LABELS,
+                    top=TRIP_TREE_LOOKAHEAD_TOP, exact=TRIP_PLAN_EXACT):
+                if TRIP_TREE_LOOKAHEAD_STRIKES and scouts:
+                    for cid, finish in zip(trip, finishes):
+                        if (self.contacts[cid].cls == HOSTILE
+                                and self.strike_blocked(state, self.contacts[cid], finish, scouts)):
+                            value -= net[cid]
+                if value > best[0]:
+                    best = (value, frozenset(trip))
+        return best
+
+    def strike_blocked(self, state, contact, obs_end, scouts):
+        """True when the cheapest free team's first-choice routes for `contact`, arriving
+        after an observation ending at obs_end, come within d_sep of one of `scouts`."""
+        groups = self.matrix.groups(contact, state.used, 1)
+        if not groups:
+            return False
+        team = arrival_order(groups[0])
+        rules_ = self.sc.rules
+        spacing = min(5.0, rules_.sync_window_s / max(1, len(team) - 1))
+        arrive = max(obs_end + rules_.confirm_margin_s + 2.0, contact.window[0])
+        z = effector_layer_sets()[0][0]
+        for i, eff in enumerate(team):
+            route, earliest = effector_route(eff, contact, arrive + spacing * i, z, 0.0, self.sc)
+            if route is None:
+                continue
+            info = self.checker.route_info(eff.id, route)
+            if info[2] or info[3] is None:
+                continue
+            for item in scouts:
+                if self.checker.pair_violation((info[0], info[3]), item):
+                    return True
+        return False
 
     def trip_move(self, current, rng):
         """Destroy and rebuild one scout's whole tour from its best label-search trip.

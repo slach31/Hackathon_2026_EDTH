@@ -315,6 +315,23 @@ Wider beams are often worse because nodes are ranked by real score plus an optim
 
 At 10% the tree often does not finish. Between 20% and 35% the difference is within noise (about ±17). The adaptive beam does not win at any share.
 
+#### Faster separation checks (`FAST_R8`, `R8_HOT_FIRST`)
+
+Profiled on L4-401 (45 s, LNS share 0.75), about 80% of LNS time is validation. About half of LNS time goes on candidates that are rejected for R8, after 84 pair checks on average. The exact geometry for pairs that pass the bounding-box filter took 10.8 s.
+
+- `FAST_R8`: a single-loop clearance test over the pieces of two routes. It computes the minimum distance of the relative linear motion for each piece pair, with limit d_sep + 1 mm against the kit's d_sep − EPS. Only "clear" is decided there; every other pair, including all same-target pairs, goes to the kit's `separation_violation`. On 90,656 route pairs from real runs and 3,000 random ones, it never cleared a pair the kit rejects. It is about twice as fast as the kit check, including piece preparation, which is cached per route id and cleared with the route cache.
+- `R8_HOT_FIRST`: aircraft from recent R8 violations are checked first. The verdicts are the same.
+
+The deterministic tree (fixed budget) gives identical plans with both on and off. Validator time per call fell by 25–50%, and LNS completed 32–40% more validator calls (L4-401 and L4-402). End to end, 6 runs each, both on against both off: L4-401 +7.7 (se 10.4), L4-402 −7.9 (se 4.5), with 14–25% more LNS iterations. That is within noise, as the convergence curve predicts.
+
+Convergence (diagnostic 120 s run, beyond the official limit): LNS keeps improving to the end. L4-401's best was 1575.0 at 30 s, 1604.8 at 60 s and 1638.4 at 120 s. L4-402's was 1150.7, 1168.1 and 1176.8. That is about 0.3–0.7 points per second late in the run, so 14–25% more iterations is worth about 3–5 points. A 2× single-core speed-up would be worth about 15–25.
+
+#### Other model experiments (flags off)
+
+- `TRIP_TREE_LOOKAHEAD` ranks each child by the next scout re-planned from the child's own plan: label search over the free contacts and unused effectors, plus a strike-vs-scout R8 check. Before LNS (equal budget, width 6) it gave L4-401 1525.8 against 1472.7, but L4-402 1127.8 against 1153.6. It does not beat width 12 or the 12 → 3 schedule (1552.4, 1153.6) on either case. It roughly doubles tree time, and the strike check alone changed nothing.
+- `OBS_SIDE_ANGLE`: angle 0 places a hostile's observation point toward the scout's home, which is the shared base, so the scout waits on the line its own strike flies in on. At 90°, strike-vs-scout R8 rejections drop by 81% (L4-401) and 82% (L4-402). Failed single steps fall from 12.5% to 9.3% on L4-401, and lost visits in the packing from 221 to 93 on L4-402. 60° is much worse. End to end (6 runs each, L1–L3 2 each), the score did not change: L4-401 −0.8, L4-402 −8.6 (about 1 se), L1–L3 −1.6. The planner already worked around those conflicts with delays, angles and layers.
+- In final plans, collisions are the primary reason for few unserved contacts: 0 on L4-401 and about 2 per run on L4-402 (96 points before strike cost). Collateral bans (576 and 844 points) and windows no scout can reach (294 and 335) cannot be served by any plan.
+
 #### Joint re-plan of n scouts (LNS operator `group`)
 
 Moving one scout at a time stays in a local optimum. A model of the board L4 cases re-planned scouts one by one and reached the same contact set as the planner. Exchanging contacts between two scouts raised the model value by 60–80 per case. Most of that gain came from cheaper scout trips, not extra coverage. The `group` operator (`GROUP_SIZES`, `GROUP_SHARE` = 20% of LNS steps, alongside `trip`) works like this:

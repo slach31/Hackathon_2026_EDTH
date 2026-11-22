@@ -916,6 +916,38 @@ class LnsLocalDeadlineTests(unittest.TestCase):
         self.assertGreater(calls["n"], 3)
 
 
+class FastR8Tests(unittest.TestCase):
+    def test_fast_clear_never_clears_a_kit_violation(self):
+        from fleetkit import validator as rules
+        sc = Scenario.from_dict(generate('L2', 3))
+        rng = random.Random(11)
+        contacts = sc.contact_by_id()
+
+        def route(aid):
+            t, p, pieces = rng.uniform(0, 50), (rng.uniform(0, 400), rng.uniform(0, 400), rng.choice((0, 30, 45, 70))), []
+            for _ in range(rng.randint(1, 5)):
+                dt = rng.choice((0.0, rng.uniform(1, 40)))
+                q = (p[0] + rng.uniform(-300, 300), p[1] + rng.uniform(-300, 300),
+                     max(0.0, p[2] + rng.choice((0, 0, 15, -15, 40))))
+                if dt == 0.0:
+                    q = p
+                pieces.append((t, t + dt, p, q))
+                t, p = t + dt, q
+            return (aid, pieces, pieces[0][0], pieces[-1][1], None)
+        cleared = violations = 0
+        for case in range(3000):
+            a, b = route('A'), route('B')
+            v = rules.separation_violation(sc.rules, contacts, a, b)
+            f = search_planner.fast_clear(search_planner.fast_pieces(a[1]), search_planner.fast_pieces(b[1]),
+                                          sc.rules.d_sep_m + search_planner.FAST_R8_SLACK_M)
+            violations += v is not None
+            cleared += f
+            if f:
+                self.assertIsNone(v, case)
+        self.assertGreater(violations, 30)
+        self.assertGreater(cleared, 100)
+
+
 class AssignTests(unittest.TestCase):
     """Effector assignment post-pass."""
     def test_min_cost_assignment_matches_brute_force(self):
