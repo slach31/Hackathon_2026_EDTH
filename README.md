@@ -217,6 +217,56 @@ Same-run comparisons, 12 concurrent planners on 12 cores, default 45 s, all plan
 
 Before LNS, the tree beat the realised packing in every 0.75 run: +11 to +48 on L4-401 and +111 to +178 on L4-402. LNS recovers much of that difference. Run-to-run spread on L4 is about ±30, so the L4-402 gains and the L1–L3 differences are within noise.
 
+#### Contact prices (`TRIP_PRICES`, off)
+
+This is a Lagrangian relaxation of "no contact in two trips". Each round, every scout runs `trip_labels` with each contact's net value lowered by that contact's price. Contacts claimed by several scouts become more expensive and unclaimed priced contacts become cheaper, using a subgradient step sized against the best packing (Polyak step). Every trip found joins the packing pool at its true value. The sum of the prices plus each scout's best priced trip bounds the packing value. The bound holds only in the planner's estimate model, and only up to the label search's pruning.
+
+Converged bounds after 300 rounds without a time limit (`analysis/trip_price_bound.py`):
+
+| Case | bound | best packing | gap | that packing, realised |
+|---|---:|---:|---:|---:|
+| L4-401 | 1703.6 | 1657.9 | 46 (2.7%) | 1394.6 |
+| L4-402 | 1272.0 | 1231.8 | 40 (3.2%) | 914.6 |
+
+Choosing trips is already within about 3% of optimal in the estimate model. The estimate itself is the bottleneck: the packing that is best on paper realises 16–26% below its estimate. Optimising harder against an optimistic model selects the trips it overrates most. That is why the validated trip tree helps and better packing does not.
+
+End to end (L4 board cases, 45 s), pricing improved the warm start when it had enough rounds (L4-401 tree before LNS: 1466 → 1588, unloaded). LNS reached the same level without it. Same-batch final-score differences against the trip-tree branch were +12/+9 and +18/+8 at 12 concurrent planners. A fix to the time budget was then tried, giving −13/−4, also at 12 concurrent planners. At 6 concurrent planners (4 runs each): branch 2803.8, prices 2784.2, prices with the hard re-plan rounds 2782.0. All of this is within noise, so it stays off.
+
+#### Where the trip estimate goes wrong (`analysis/estimate_gap.py`)
+
+The script realises the trip packing with the tree, pricing and repair all off, and with no time cap on the packing, so its output is deterministic. It then splits the gap between estimated and realised value into three parts. Board L4 cases, before the changes below:
+
+| | L4-401 | L4-402 |
+|---|---:|---:|
+| estimate − realised | 187 | 129 |
+| visits not realised (points − their estimated strike cost) | 162 | 94 |
+| strikes costing more than estimated | 42 | 36 |
+| scout energy | ≈ 0 | ≈ 0 |
+
+Lost visits fail on the scout route, mostly R8 and sometimes R1. Most R8 rejections pair a scout with an effector (244 of 421 on L4-401; 91 are scout–scout). The 30 m scout layer was added before ground-level strikes existed. Ground strike lines pass 30 m below such a scout, inside d_sep = 40 m. The strikes are then pushed to the 85/130 m layers, which is the strike-cost excess, and scout visits near strike lines fail. The speed assumption contributes almost nothing: effectors fly at 0.995 × v_h, and their best-range speed is at or above v_h.
+
+Two changes:
+
+- `SCOUT_LOW_Z = 45.0` replaces the 30 m scout layer. It clears every ground strike, observes from about 143 m instead of about 147 m, and costs about 0.3 Wh more climb per scout.
+- `EXACT_STRIKE_COSTS`: candidate-matrix costs come from the energy of the route `strikes()` tries first (ground, else 30 m), not from the distance-plus-40 m-climb estimate. `CandidateMatrix.refine` applies them.
+
+A single realised packing is chaotic: one changed R8 conflict early on reorders everything after it. Single runs of this script move by ±200 between settings, so the changes were judged end to end. 45 s default, 8 concurrent planners (4 batches) for the first table:
+
+| L4 total (4 runs each) | 30 m | 45 m |
+|---|---:|---:|
+| estimated costs | 2753.8 | 2752.0 |
+| exact costs | 2757.9 | 2775.1 |
+
+Neither change helps alone. Together, on the board cases:
+
+| Case | before | 45 m + exact | Δ |
+|---|---:|---:|---:|
+| L4-401 (10 runs each) | 1596.2 | 1627.0 | +30.8 (≈ 5 standard errors) |
+| L4-402 (10 runs each) | 1157.6 | 1153.1 | −4.5 (noise) |
+| L1–L3, 6 cases, 2 runs each | 2217.5 | 2222.7 | +5.2 (no case lower) |
+
+On L4-402, zones block most ground lines, so its strikes fly at 30 m and a 45 m scout is still only 15 m above them.
+
 #### Joint re-plan of n scouts (LNS operator `group`)
 
 Moving one scout at a time stays in a local optimum. A model of the board L4 cases re-planned scouts one by one and reached the same contact set as the planner. Exchanging contacts between two scouts raised the model value by 60–80 per case. Most of that gain came from cheaper scout trips, not extra coverage. The `group` operator (`GROUP_SIZES`, `GROUP_SHARE` = 20% of LNS steps, alongside `trip`) works like this:

@@ -32,6 +32,14 @@ class CandidateMatrix:
                           + a.power.p0_w * climb / 3600.0)
                 self.costs[a.id, c.id] = scenario.rules.lambda_e * energy + scenario.rules.c_eff
 
+    def refine(self, energy_wh):
+        """Replace estimated costs by energy_wh(effector, contact) where it returns Wh
+        (e.g. the energy of the route the planner would build); None keeps the estimate."""
+        for (aid, cid), cost in list(self.costs.items()):
+            wh = energy_wh(aid, cid)
+            if wh is not None:
+                self.costs[aid, cid] = self.scenario.rules.lambda_e * wh + self.scenario.rules.c_eff
+
     def groups(self, contact, used, limit=3):
         """Shortlist exact subtype mixes; never prune on estimated energy/time."""
         if contact.id in self.banned:

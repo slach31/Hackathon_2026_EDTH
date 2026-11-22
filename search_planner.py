@@ -22,11 +22,14 @@ from fleetkit.scorer import evaluate
 from fleetkit import validator as rules
 from candidate_matrix import CandidateMatrix
 
-# The kit's scout layers (70, 110 m) plus a low one. At 30 m the 3D observation range allows
-# observing from ~139 m instead of ~123 m, and the climb is shorter, so early windows are
-# reached sooner. Official check_handin, L1-L4 seeds 35-39: 9913.7 -> 10089.6 (+1.8%),
-# L4 +3.0%; with seeds 30-34 and the two validation L4s, L4 won 10 of 12 cases.
-SCOUT_LAYERS = tuple(SCOUT_LAYERS) + (30.0,)
+# The kit's scout layers (70, 110 m) plus a low one. A low layer observes from further out
+# in 3D and climbs less, so early windows are reached sooner (30 m, measured before ground
+# strikes: L1-L4 seeds 35-39 +1.8%, L4 +3.0%). With ground strikes, 30 m scouts are only
+# 30 m above the strike lines (d_sep 40 m): strikes were pushed to the 85/130 m layers and
+# scout visits failed R8. 45 m clears every ground strike; with EXACT_STRIKE_COSTS, board
+# L4-401 +30.8 (10 runs each), L4-402 -4.5 (noise), L1-L3 +5.2 (README).
+SCOUT_LOW_Z = 45.0
+SCOUT_LAYERS = tuple(SCOUT_LAYERS) + (SCOUT_LOW_Z,)
 
 
 class DeadlineReached(Exception):
@@ -794,6 +797,22 @@ TRIP_PLAN_ROUNDS = 2     # re-plan each scout around the others' chosen trips, r
 TRIP_PLAN_LABELS = 4     # labels kept per contact while generating plan trips
 TRIP_PLAN_EXACT = False  # plan trips use straight legs (detours are ~95% of the label time)
 TRIP_PLAN_DROPS = 2      # extra searches per scout without one of its best trip's contacts
+TRIP_PACK_S = 0.3        # time cap per pack_trips call
+# Strike costs in the candidate matrix from the energy of the route strikes() tries first
+# (ground, else 30 m) instead of the distance/40 m climb estimate.
+EXACT_STRIKE_COSTS = True
+# Contact prices (Lagrangian relaxation of "no contact in two trips"); replaces the
+# TRIP_PLAN_ROUNDS hard re-planning rounds when on. Each round every
+# scout picks its best trips with each contact's net value lowered by its price; contacts
+# claimed by several scouts get dearer, unclaimed priced ones cheaper (subgradient step,
+# Polyak size against the best packing). Every trip found joins the packing pool at its
+# true value. sum(prices) + sum(best priced trip per scout) bounds the packing value (up
+# to the label search's pruning).
+TRIP_PRICES = False      # off: no end-to-end gain measured (README); analysis/trip_price_bound.py
+TRIP_PRICE_ROUNDS = 40   # at most this many rounds
+TRIP_PRICE_TOP = 5       # priced trips kept per scout, layer and round
+TRIP_PRICE_THETA = 1.0   # initial Polyak factor, halved after 4 rounds without a better bound
+TRIP_PRICE_SHARE = 0.35  # at most this share of the trip plan window (ends by its half)
 # Validated trip tree on top of the packing. Depth = one scout (best packed trip first);
 # a node's children are that scout's best disjoint pregenerated trips (ranked by trip
 # value + a greedy estimate for the scouts after it), the packed trip, and "no trip".
@@ -1802,6 +1821,8 @@ class Search:
         except DeadlineReached:
             pass
         self.matrix = CandidateMatrix(self.sc)
+        if EXACT_STRIKE_COSTS:
+            self.matrix.refine(self.strike_energy)
         contacts = [c for c in self.sc.contacts if c.cls in (HOSTILE, UNKNOWN)
                     and c.window is not None and c.id not in self.matrix.banned]
         priorities = {c.id: self.matrix.priority(c) for c in contacts}
@@ -1931,6 +1952,24 @@ class Search:
             out.append((c.id, obs_point(self.sc, scout, c, 0.0, z), (lo, hi), net, latest))
         return out
 
+    def strike_energy(self, aid, cid):
+        """Wh of the first route strikes() tries for this effector alone (ground, else
+        30 m), arriving as late as the window allows; None when it has no valid route."""
+        eff, contact = self.aircraft[aid], self.contacts[cid]
+        if contact.window is None:
+            return None
+        z, angle = effector_layer_sets()[0][0], 0.0
+        route, earliest = effector_route(eff, contact, 0.0, z, angle, self.sc)
+        if route is None:
+            if earliest > contact.window[1] + EPS:
+                return None
+            route, _ = effector_route(eff, contact, max(earliest, contact.window[0]), z, angle,
+                                      self.sc)
+        if route is None:
+            return None
+        info = self.checker.route_info(aid, route)
+        return None if info[2] else info[4]
+
     def effector_earliest(self, eff, contact):
         key = ("eff_earliest", eff.id, contact.id)
         hit = self._trip_cache.get(key)
@@ -2051,7 +2090,7 @@ class Search:
         start = time.monotonic()
         unique = {}
         scouts = [a for a in self.sc.aircraft if a.type == SCOUT]
-        layers = (SCOUT_LAYERS[0], min(SCOUT_LAYERS))
+        layers = tuple(dict.fromkeys((SCOUT_LAYERS[0], min(SCOUT_LAYERS))))
         cands = {(a.id, z): self.trip_candidates(a, frozenset(), set(), z)
                  for a in scouts for z in layers}
 
@@ -2078,10 +2117,13 @@ class Search:
                     net = {c[0]: c[3] for c in cands[scout.id, z]}
                     for cid in sorted(found[0][1], key=lambda c: -net[c])[:TRIP_PLAN_DROPS]:
                         add(scout, z, {cid}, top=3, cover=False)
-        pack_stop = lambda: min(stop, time.monotonic() + 0.3)
+        pack_stop = lambda: min(stop, time.monotonic() + TRIP_PACK_S)
         value, chosen = pack_trips(list(unique.values()), pack_stop())
+        if TRIP_PRICES:
+            value, chosen = self.price_trips(scouts, layers, cands, rows, unique, value,
+                                             chosen, start, stop, pack_stop)
         rounds = 0
-        for _ in range(TRIP_PLAN_ROUNDS):
+        for _ in range(0 if TRIP_PRICES else TRIP_PLAN_ROUNDS):
             for scout in scouts:
                 held = {cid for tr in chosen if tr[1] != scout.id for cid in tr[2]}
                 for z in layers:
@@ -2091,6 +2133,7 @@ class Search:
         self.trip_stats.update(candidates=len(unique), chosen=len(chosen), rounds=rounds,
                                estimate=round(value, 3),
                                label_s=round(time.monotonic() - start, 4))
+        self.trip_chosen = (cands, chosen)      # for analysis/estimate_gap.py
         visits = sorted(((f, self.aircraft[sid], cid, z)
                          for _, sid, _, (z, order, finishes) in chosen
                          for cid, f in zip(order, finishes)), key=lambda v: (v[0], v[2]))
@@ -2120,6 +2163,72 @@ class Search:
         self.trip_stats.update(score=round(state.score, 3),
                                seconds=round(time.monotonic() - start, 3))
         return state
+
+    def price_trips(self, scouts, layers, cands, rows, unique, value, chosen, start, stop,
+                    pack_stop):
+        """Subgradient rounds of contact prices (TRIP_PRICES); adds the trips found to
+        `unique` and returns the re-packed (value, chosen)."""
+        # Leave at least half of the trip plan window for realisation and the tree.
+        window = max(0.0, stop - start)
+        price_stop = min(stop, time.monotonic() + TRIP_PRICE_SHARE * window, start + 0.5 * window)
+        price_start = time.monotonic()
+        lam, bound_best, theta, stale, rounds = {}, math.inf, TRIP_PRICE_THETA, 0, 0
+        added = 0
+        for _ in range(TRIP_PRICE_ROUNDS):
+            if time.monotonic() >= price_stop:
+                break
+            self.checker.check_time(stop)
+            bound = sum(lam.values())
+            claims = {}
+            for scout in scouts:
+                top_value, top_order = 0.0, ()
+                for z in layers:
+                    pool = cands[scout.id, z]
+                    priced = [(c[0], c[1], c[2], c[3] - lam.get(c[0], 0.0), c[4]) for c in pool]
+                    found = trip_labels(self.sc, scout, priced, z, keep=TRIP_PLAN_LABELS,
+                                        top=TRIP_PRICE_TOP, rows=rows[scout.id, z],
+                                        exact=TRIP_PLAN_EXACT)
+                    for pv, order, wh, finishes in found:
+                        true = pv + sum(lam.get(c, 0.0) for c in order)
+                        key = (scout.id, frozenset(order))
+                        if true > 0 and (key not in unique or true > unique[key][0]):
+                            added += key not in unique
+                            unique[key] = (true, scout.id, frozenset(order), (z, order, finishes))
+                    if found and found[0][0] > top_value:
+                        top_value, top_order = found[0][0], found[0][1]
+                bound += top_value
+                for cid in top_order:
+                    claims[cid] = claims.get(cid, 0) + 1
+            rounds += 1
+            if bound < bound_best - 1e-6:
+                bound_best, stale = bound, 0
+            else:
+                stale += 1
+                if stale >= 4:
+                    theta, stale = theta / 2.0, 0
+            if rounds % 5 == 0:
+                value, chosen = max((value, chosen), pack_trips(list(unique.values()), pack_stop()),
+                                    key=lambda vc: vc[0])
+            grad = {}
+            for cid in set(lam) | set(claims):
+                g = claims.get(cid, 0) - 1
+                if g < 0 and lam.get(cid, 0.0) <= 0.0:
+                    continue
+                grad[cid] = g
+            norm = sum(g * g for g in grad.values())
+            if norm == 0:
+                break           # no contact claimed twice: the priced trips pack exactly
+            step = theta * max(bound - value, 1e-3) / norm
+            for cid, g in grad.items():
+                lam[cid] = max(0.0, lam.get(cid, 0.0) + step * g)
+        # The pool only grows, but pack_trips is time-capped: keep the best packing seen.
+        value, chosen = max((value, chosen), pack_trips(list(unique.values()), pack_stop()),
+                            key=lambda vc: vc[0])
+        self.trip_stats["prices"] = {
+            "rounds": rounds, "bound": round(bound_best, 3), "packed": round(value, 3),
+            "gap": round(bound_best - value, 3), "priced": sum(1 for v in lam.values() if v > 0),
+            "added": added, "seconds": round(time.monotonic() - price_start, 3)}
+        return value, chosen
 
     def trip_tree(self, unique, chosen, stop, depth0, ratio=1.0):
         """Beam over whole pregenerated scout trips with validated nodes (TRIP_TREE).
