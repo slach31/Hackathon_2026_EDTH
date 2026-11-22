@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import math
 import random
 import shutil
 import subprocess
@@ -452,7 +453,10 @@ class LnsTests(unittest.TestCase):
                     self.assertGreater(len(bursts), 1)
                     self.assertTrue(all(b is not None and b <= search.stop for b in bursts[:-1]))
                 else:
-                    self.assertEqual(bursts, [None])
+                    # LNS stops ASSIGN_S early to leave the assignment post-pass its time.
+                    reserve = search_planner.ASSIGN_S if search_planner.ASSIGN_PASS else 0.0
+                    self.assertEqual(len(bursts), 1)
+                    self.assertAlmostEqual(bursts[0], search.stop - reserve, places=6)
                 if 'adaptive' in flags:
                     self.assertNotEqual(set(report['weights'].values()), {1.0})
 
@@ -892,6 +896,119 @@ class TripPlanTests(unittest.TestCase):
             result = evaluate(sc, s.plan(sc.seed))
             self.assertTrue(result.valid)
             self.assertAlmostEqual(result.score, s.score, places=6)
+
+
+class LnsLocalDeadlineTests(unittest.TestCase):
+    def test_local_deadline_in_one_move_does_not_end_lns(self):
+        sc = Scenario.from_dict(generate('L3', 4))
+        search = Search(sc, seconds=4.0, lns_share=0.6)
+        step = search.lns_step
+        calls = {"n": 0}
+
+        def flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise search_planner.DeadlineReached   # as a move's local cap would
+            return step(*args, **kwargs)
+        search.lns_step = flaky
+        search.run()
+        self.assertEqual(search.lns.get("local_timeouts"), 1)
+        self.assertGreater(calls["n"], 3)
+
+
+class AssignTests(unittest.TestCase):
+    """Effector assignment post-pass."""
+    def test_min_cost_assignment_matches_brute_force(self):
+        import itertools
+        rng = random.Random(3)
+        for case in range(200):
+            n = rng.randint(1, 4)
+            m = rng.randint(n, 5)
+            cost = [[rng.choice((rng.uniform(0, 10), 1e6)) for _ in range(m)] for _ in range(n)]
+            want = min(sum(cost[i][p[i]] for i in range(n)) for p in itertools.permutations(range(m), n))
+            got = search_planner.min_cost_assignment(cost)
+            self.assertEqual(len(set(got)), n, case)
+            self.assertAlmostEqual(sum(cost[i][got[i]] for i in range(n)), want, places=6)
+
+    def test_assign_pass_returns_valid_better_plan_or_none(self):
+        sc = Scenario.from_dict(generate('L4', 9))
+        search = Search(sc, seconds=6.0, lns_share=0.3)
+        best = search.run()[0][0]
+        search.checker.stop = time.monotonic() + 60.0
+        out = search.assign_pass(best, time.monotonic() + 30.0)
+        self.assertIn('changed', search.assign_stats)
+        if out is not None:
+            self.assertGreater(out.score, best.score)
+            result = evaluate(sc, out.plan(sc.seed))
+            self.assertTrue(result.valid)
+            self.assertAlmostEqual(result.score, out.score, places=6)
+
+
+class VisitValueTests(unittest.TestCase):
+    """SEP_RISK and VISIT_LEARN corrections of trip-search visit values."""
+    def setUp(self):
+        self.saved = (search_planner.SEP_RISK, search_planner.VISIT_LEARN)
+
+    def tearDown(self):
+        search_planner.SEP_RISK, search_planner.VISIT_LEARN = self.saved
+
+    def search(self):
+        sc = Scenario.from_dict(generate('L4', 9))
+        search = Search(sc, seconds=20)
+        search.matrix = CandidateMatrix(sc)
+        return sc, search
+
+    def test_point_segment_hdist(self):
+        d = search_planner.point_segment_hdist
+        self.assertAlmostEqual(d((5, 3, 70), (0, 0), (10, 0)), 3.0)
+        self.assertAlmostEqual(d((-4, 3), (0, 0), (10, 0)), 5.0)
+        self.assertAlmostEqual(d((13, 4), (0, 0), (10, 0)), 5.0)
+        self.assertAlmostEqual(d((1, 1), (2, 2), (2, 2)), math.sqrt(2))
+
+    def test_off_keeps_values(self):
+        search_planner.SEP_RISK = search_planner.VISIT_LEARN = False
+        sc, search = self.search()
+        search.visit_outcomes[('S01', 'C01', 45.0)] = (0, 5)
+        self.assertEqual(search.visit_keep('S01', 'C01', (0.0, 0.0, 45.0), 45.0), 1.0)
+
+    def test_sep_risk_discounts_points_on_conflicting_strike_lines(self):
+        search_planner.SEP_RISK, search_planner.VISIT_LEARN = True, False
+        sc, search = self.search()
+        lines = search.strike_lines()
+        self.assertTrue(lines)
+        a, b, zs = lines[0]
+        mid = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+        near = search.visit_keep('S01', 'C01', mid + (zs + 20.0,), zs + 20.0)
+        self.assertLess(near, 1.0)
+        # Far enough above every strike line: no discount.
+        high = zs + sc.rules.d_sep_m + 100.0
+        self.assertEqual(search.visit_keep('S01', 'C01', mid + (high,), high), 1.0)
+
+    def test_visit_learn_scales_by_outcomes(self):
+        search_planner.SEP_RISK, search_planner.VISIT_LEARN = False, True
+        sc, search = self.search()
+        scout = next(a for a in sc.aircraft if a.type == 'scout')
+        z = search_planner.SCOUT_LAYERS[0]
+        before = {c[0]: c[3] for c in search.trip_candidates(scout, frozenset(), set(), z)}
+        cid = next(iter(before))
+        search.visit_outcomes[scout.id, cid, z] = (1, 3)
+        after = {c[0]: c[3] for c in search.trip_candidates(scout, frozenset(), set(), z)}
+        self.assertAlmostEqual(after[cid], before[cid] * 0.5)
+        for other, value in before.items():
+            if other != cid:
+                self.assertAlmostEqual(after[other], value)
+
+    def test_realise_visit_records_outcomes_and_run_is_valid(self):
+        search_planner.SEP_RISK = search_planner.VISIT_LEARN = True
+        sc = Scenario.from_dict(generate('L3', 4))
+        search = Search(sc, seconds=6.0, lns_share=0.5)
+        verified = search.run()
+        self.assertTrue(search.visit_outcomes)
+        for ok, tried in search.visit_outcomes.values():
+            self.assertLessEqual(ok, tried)
+        for state, result in verified:
+            self.assertTrue(evaluate(sc, state.plan(sc.seed)).valid)
+            self.assertAlmostEqual(result.score, state.score, places=6)
 
 
 class GroupTests(unittest.TestCase):

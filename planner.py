@@ -79,7 +79,7 @@ def main():
         save_json(report, args.artifacts / "tree.json")
         save_tree(report, args.artifacts / "tree.html")
     print(json.dumps({key: report[key] for key in
-                      ("elapsed_s", "passes", "lns", "trip_plan", "candidate_checks", "rejections",
+                      ("elapsed_s", "passes", "lns", "trip_plan", "assign", "candidate_checks", "rejections",
                        "unserved", "unserved_points", "contacts", "solutions") if key in report}), file=sys.stderr)
 
 

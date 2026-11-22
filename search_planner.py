@@ -10,6 +10,7 @@ import heapq
 import itertools
 import math
 import random
+import statistics
 import time
 
 from fleetkit import baseline
@@ -30,6 +31,56 @@ from candidate_matrix import CandidateMatrix
 # L4-401 +30.8 (10 runs each), L4-402 -4.5 (noise), L1-L3 +5.2 (README).
 SCOUT_LOW_Z = 45.0
 SCOUT_LAYERS = tuple(SCOUT_LAYERS) + (SCOUT_LOW_Z,)
+
+
+def point_segment_hdist(p, a, b):
+    """Horizontal distance from point p to segment a-b."""
+    ax, ay = a[0], a[1]
+    dx, dy = b[0] - ax, b[1] - ay
+    n = dx * dx + dy * dy
+    f = 0.0 if n <= 0 else max(0.0, min(1.0, ((p[0] - ax) * dx + (p[1] - ay) * dy) / n))
+    return math.hypot(p[0] - ax - f * dx, p[1] - ay - f * dy)
+
+
+def min_cost_assignment(cost):
+    """Hungarian algorithm (potentials) for a rectangular n x m cost matrix, n <= m.
+    Returns the column assigned to each row."""
+    n, m = len(cost), len(cost[0])
+    inf = float("inf")
+    u, v = [0.0] * (n + 1), [0.0] * (m + 1)
+    p, way = [0] * (m + 1), [0] * (m + 1)
+    for i in range(1, n + 1):
+        p[0], j0 = i, 0
+        minv, used = [inf] * (m + 1), [False] * (m + 1)
+        while True:
+            used[j0] = True
+            i0, delta, j1 = p[j0], inf, 0
+            row = cost[i0 - 1]
+            for j in range(1, m + 1):
+                if not used[j]:
+                    cur = row[j - 1] - u[i0] - v[j]
+                    if cur < minv[j]:
+                        minv[j], way[j] = cur, j0
+                    if minv[j] < delta:
+                        delta, j1 = minv[j], j
+            for j in range(m + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while j0:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+    out = [0] * n
+    for j in range(1, m + 1):
+        if p[j]:
+            out[p[j] - 1] = j - 1
+    return out
 
 
 class DeadlineReached(Exception):
@@ -798,9 +849,30 @@ TRIP_PLAN_LABELS = 4     # labels kept per contact while generating plan trips
 TRIP_PLAN_EXACT = False  # plan trips use straight legs (detours are ~95% of the label time)
 TRIP_PLAN_DROPS = 2      # extra searches per scout without one of its best trip's contacts
 TRIP_PACK_S = 0.3        # time cap per pack_trips call
+# Effector assignment post-pass on the best plan: per subtype, a min-cost assignment of
+# effectors to the plan's strike slots on exact strike costs (Hungarian); teams that change
+# are removed and rebuilt through strikes() with incremental validation. Kept only if the
+# plan's score rises. Runs in the last ASSIGN_S seconds (taken from LNS).
+ASSIGN_PASS = True
+ASSIGN_S = 0.5
+# Trip-search value corrections (both off by default; not yet benchmarked).
+# SEP_RISK: a visit whose observation point is within the R8 reach of a strike line (shared
+# base -> hostile, at 0 m when the cheapest team's ground line is clear, else 30 m) whose
+# altitude is within d_sep of the scout layer keeps SEP_RISK_KEEP of its value per such
+# line: the scout hovers there for the dwell while effectors pass.
+SEP_RISK = False
+SEP_RISK_KEEP = 0.85
+SEP_RISK_MARGIN_M = 10.0
+# VISIT_LEARN: realise_visit records each (scout, contact, layer) outcome; the trip search
+# scales the visit's value by (successes + 1) / (attempts + 1): untried visits keep it all.
+VISIT_LEARN = False
 # Strike costs in the candidate matrix from the energy of the route strikes() tries first
 # (ground, else 30 m) instead of the distance/40 m climb estimate.
 EXACT_STRIKE_COSTS = True
+# STRIKE_COST_FALLBACKS: price pairs whose first route fails by the first valid layer/angle
+# strikes() would try, and mark pairs that cannot arrive in the window infeasible (inf).
+# Off by default (not benchmarked); off reproduces the first-route-only pricing.
+STRIKE_COST_FALLBACKS = False
 # Contact prices (Lagrangian relaxation of "no contact in two trips"); replaces the
 # TRIP_PLAN_ROUNDS hard re-planning rounds when on. Each round every
 # scout picks its best trips with each contact's net value lowered by its price; contacts
@@ -824,6 +896,27 @@ TRIP_TREE_WIDTH = 6      # nodes kept per depth
 TRIP_TREE_BRANCH = 5     # trips tried per node (plus the packed trip and "no trip")
 TRIP_TREE_POOL = 30      # a scout's best disjoint trips ranked for branching
 TRIP_TREE_SHARE = 0.2    # trip plan + tree share of the whole budget (may pass beam_stop)
+# Adaptive beam (off): instead of TRIP_TREE_WIDTH nodes per depth, keep every child within a
+# margin of the best child's key, the margin scaling with how much the best key changed from
+# the previous depth: max(TRIP_TREE_MARGIN_MIN, TRIP_TREE_MARGIN_FRAC x |change|), at least
+# one node and at most TRIP_TREE_MAX_WIDTH.
+# "noise" (also off): the margin is max(TRIP_TREE_MARGIN_MIN, TRIP_TREE_NOISE_K x stdev of
+# the tree's own estimate errors so far), an error being a trip's estimated value minus
+# what realising it added: children that the estimate cannot tell apart are all kept.
+# TRIP_TREE_DIVERSE (off): at most one beam node per set of contacts held, so variants of
+# the same contacts with other strike routes do not crowd out different choices.
+TRIP_TREE_ADAPTIVE = False      # False | True ("change") | "noise"
+TRIP_TREE_MARGIN_FRAC = 0.25
+TRIP_TREE_MARGIN_MIN = 2.0
+TRIP_TREE_MAX_WIDTH = 12
+TRIP_TREE_NOISE_K = 1.0
+TRIP_TREE_DIVERSE = False
+# Width schedule (None: TRIP_TREE_WIDTH at every depth): (start, end) beam widths, falling
+# linearly from the first scout to the last. The first scouts' choices decide most.
+TRIP_TREE_SCHEDULE = None
+# Total trip realisations for the tree instead of the time share per depth (None: time).
+# For deterministic comparisons; each depth gets an equal share of what is left.
+TRIP_TREE_NODE_BUDGET = None
 
 
 def pack_trips(trips, stop=None):
@@ -1336,6 +1429,8 @@ class Search:
                     "strike_gain": 0.0}
         self._trip_cache = {}
         self.trip_stats = {}
+        self._strike_lines = None
+        self.visit_outcomes = {}     # (scout, contact, layer) -> (realised, attempts)
         self.lns_share = lns_share
         self.interleave, self.adaptive, self.restarts = interleave, adaptive, restarts
         # Later passes keep a wider beam: more outranked branches survive to the end.
@@ -1811,6 +1906,12 @@ class Search:
     def run(self):
         contacts, priorities = self.search_phase()
         self.improve_phase(contacts, priorities)
+        if ASSIGN_PASS and contacts:
+            self.checker.stop = self.stop
+            try:
+                self.assign_pass(self.archive[0], self.stop)
+            except DeadlineReached:
+                pass
         return self.finalize()
 
     def search_phase(self):
@@ -1862,10 +1963,104 @@ class Search:
         except DeadlineReached:
             pass
         self.checker.stop = self.stop
+        reserve = ASSIGN_S if ASSIGN_PASS else 0.0
         try:
-            self.improve(contacts, priorities)
+            self.improve(contacts, priorities, self.stop - reserve)
         except DeadlineReached:
             pass
+
+    def assign_pass(self, state, stop):
+        """Effector assignment post-pass (ASSIGN_PASS). Returns the improved state or None."""
+        start = time.monotonic()
+        stats = self.assign_stats = {"slots": 0, "changed": 0, "est_gain": 0.0,
+                                     "rebuilt": 0, "failed": 0, "gain": 0.0}
+        rules_ = self.sc.rules
+        teams = {}
+        for aid, route in state.parsed.items():
+            if self.aircraft[aid].type != EFFECTOR:
+                continue
+            for w in route.waypoints:
+                if w.action == "engage" and w.target in self.contacts:
+                    teams.setdefault(w.target, []).append(aid)
+        observed = {}
+        for sid, route in state.routes.items():
+            if self.aircraft[sid].type != SCOUT:
+                continue
+            for w in route:
+                cid = w.get("target")
+                if w.get("action") == "observe" and cid in teams:
+                    end = w["t"] + w.get("dwell_s", 0.0)
+                    if cid not in observed or end < observed[cid][1]:
+                        observed[cid] = (sid, end)
+        teams = {cid: team for cid, team in teams.items() if cid in observed}
+        if not teams:
+            return None
+        big = 1e6
+        new = {cid: [] for cid in teams}
+        for sub in sorted({self.aircraft[a].subtype for t in teams.values() for a in t}):
+            slots = [cid for cid in sorted(teams) for _ in range(self.contacts[cid].needs.get(sub, 0))]
+            effs = [a for a in self.matrix.effectors if a.subtype == sub]
+            if not slots or len(slots) > len(effs):
+                return None
+            cost = []
+            for cid in slots:
+                c = self.contacts[cid]
+                n = len(teams[cid])
+                spacing = min(5.0, rules_.sync_window_s / max(1, n - 1)) * (n - 1)
+                ready = max(observed[cid][1] + rules_.confirm_margin_s + 2.0, c.window[0])
+                row = []
+                for a in effs:
+                    ok = (a.id, cid) in self.matrix.costs and (
+                        max(ready, self.effector_earliest(a, c)) + spacing <= c.window[1] + EPS)
+                    row.append(min(big, self.matrix.costs[a.id, cid]) if ok else big)
+                cost.append(row)
+            cols = min_cost_assignment(cost)
+            current = sum(self.matrix.costs.get((a, cid), big) for cid in teams
+                          for a in teams[cid] if self.aircraft[a].subtype == sub)
+            total = sum(cost[r][k] for r, k in enumerate(cols))
+            stats["slots"] += len(slots)
+            if total >= big or total >= current - 1e-6:
+                for cid in teams:
+                    new[cid] += [a for a in teams[cid] if self.aircraft[a].subtype == sub]
+                continue
+            stats["est_gain"] += current - total
+            for r, k in enumerate(cols):
+                new[slots[r]].append(effs[k].id)
+        changed = sorted((cid for cid in teams if set(new[cid]) != set(teams[cid])),
+                         key=lambda cid: (self.contacts[cid].window[1], cid))
+        stats["changed"] = len(changed)
+        if not changed:
+            return None
+        removed = {a for cid in changed for a in teams[cid]}
+        current = self.checker.without(state, removed)
+        taken = {a for cid in teams if cid not in changed for a in teams[cid]}
+        for cid in changed:
+            contact = self.contacts[cid]
+            sid, obs_end = observed[cid]
+            scout = self.aircraft[sid]
+            child = None
+            for team in (new[cid], teams[cid]):
+                if taken & set(team):
+                    continue
+                group = tuple(self.aircraft[a] for a in team)
+                for candidate, _ in self.strikes(current, contact, [group], scout,
+                                                 current.routes[sid], obs_end, stop):
+                    child = candidate
+                    break
+                if child is not None:
+                    taken |= set(team)
+                    break
+            if child is None:
+                stats["failed"] += 1
+                continue
+            stats["rebuilt"] += 1
+            current = child
+        stats["seconds"] = round(time.monotonic() - start, 3)
+        if current.score > state.score + 1e-6:
+            stats["gain"] = round(current.score - state.score, 3)
+            current = replace(current, tasks=state.tasks)
+            return self.record(current, state, {"kind": "assign", "changed": changed}, 0)
+        return None
 
     def finalize(self):
         # Official full validation is the authority; archive can include partial
@@ -1947,28 +2142,78 @@ class Search:
             else:
                 net = c.points
             latest = min(latest, deadlines.get(c.id, math.inf))
+            point = obs_point(self.sc, scout, c, 0.0, z)
+            if net > 0:
+                net *= self.visit_keep(scout.id, c.id, point, z)
             if net <= 0 or latest < lo + rules_.obs_dwell_s:
                 continue
-            out.append((c.id, obs_point(self.sc, scout, c, 0.0, z), (lo, hi), net, latest))
+            out.append((c.id, point, (lo, hi), net, latest))
         return out
 
+    def strike_lines(self):
+        """[(base xy, hostile xy, strike altitude)] for every strikable hostile."""
+        if self._strike_lines is None:
+            effs = self.matrix.effectors
+            base = (sum(a.home[0] for a in effs) / max(1, len(effs)),
+                    sum(a.home[1] for a in effs) / max(1, len(effs)))
+            lines = []
+            for c in self.sc.contacts:
+                if c.cls != HOSTILE or c.window is None or c.id in self.matrix.banned:
+                    continue
+                groups = self.matrix.groups(c, set(), 1)
+                if not groups:
+                    continue
+                ground = all(ground_route(a, c, math.inf, self.sc) is not None for a in groups[0])
+                lines.append((base, (c.pos[0], c.pos[1]), GROUND_Z if ground else 30.0))
+            self._strike_lines = lines
+        return self._strike_lines
+
+    def visit_keep(self, sid, cid, point, z):
+        """Share of a visit's net value the trip search keeps (SEP_RISK, VISIT_LEARN)."""
+        keep = 1.0
+        if SEP_RISK:
+            d = self.sc.rules.d_sep_m
+            for a, b, zs in self.strike_lines():
+                dz = abs(z - zs)
+                if dz >= d:
+                    continue
+                reach = math.sqrt(d * d - dz * dz) + SEP_RISK_MARGIN_M
+                if point_segment_hdist(point, a, b) < reach:
+                    keep *= SEP_RISK_KEEP
+        if VISIT_LEARN:
+            ok, tried = self.visit_outcomes.get((sid, cid, z), (0, 0))
+            keep *= (ok + 1.0) / (tried + 1.0)
+        return keep
+
     def strike_energy(self, aid, cid):
-        """Wh of the first route strikes() tries for this effector alone (ground, else
-        30 m), arriving as late as the window allows; None when it has no valid route."""
+        """Wh of the first valid route strikes() would try for this effector alone (layer
+        sets in order, angles 0/35/-35), arriving as late as the window allows; math.inf
+        when it cannot arrive within the window; None when no layer/angle gives a valid
+        route (the estimate is kept)."""
         eff, contact = self.aircraft[aid], self.contacts[cid]
         if contact.window is None:
             return None
-        z, angle = effector_layer_sets()[0][0], 0.0
-        route, earliest = effector_route(eff, contact, 0.0, z, angle, self.sc)
-        if route is None:
-            if earliest > contact.window[1] + EPS:
-                return None
-            route, _ = effector_route(eff, contact, max(earliest, contact.window[0]), z, angle,
-                                      self.sc)
-        if route is None:
-            return None
-        info = self.checker.route_info(aid, route)
-        return None if info[2] else info[4]
+        lo, hi = contact.window
+        slow = True
+        sets = effector_layer_sets() if STRIKE_COST_FALLBACKS else effector_layer_sets()[:1]
+        angles = (0.0, 35.0, -35.0) if STRIKE_COST_FALLBACKS else (0.0,)
+        for layers in sets:
+            for angle in angles:
+                route, earliest = effector_route(eff, contact, 0.0, layers[0], angle, self.sc)
+                if route is None:
+                    if earliest > hi + EPS:
+                        continue
+                    slow = False
+                    route, _ = effector_route(eff, contact, max(earliest, lo), layers[0], angle,
+                                              self.sc)
+                else:
+                    slow = False
+                if route is None:
+                    continue
+                info = self.checker.route_info(aid, route)
+                if not info[2]:
+                    return info[4]
+        return math.inf if slow and STRIKE_COST_FALLBACKS else None
 
     def effector_earliest(self, eff, contact):
         key = ("eff_earliest", eff.id, contact.id)
@@ -2077,6 +2322,8 @@ class Search:
                                     self.stats(cid), progress, {"count": 0, "seen": set()}):
             if best is None or child.score > best.score:
                 best = child
+        ok, tried = self.visit_outcomes.get((scout.id, cid, z), (0, 0))
+        self.visit_outcomes[scout.id, cid, z] = (ok + (best is not None), tried + 1)
         return best
 
     def trip_plan(self, stop):
@@ -2260,6 +2507,9 @@ class Search:
         beam = [(self.root, frozenset())]
         best = None
         seen = set()
+        prev_key = rest_value(0, frozenset())
+        stats["widths"] = []
+        errors = []        # trip estimate - realised gain, for the "noise" margin
         try:
             for d, sid in enumerate(order):
                 scout = self.aircraft[sid]
@@ -2280,11 +2530,16 @@ class Search:
                     queues.append((state, taken, options))
                 width = max((len(q[2]) for q in queues), default=0)
                 tried = 0
+                if TRIP_TREE_NODE_BUDGET is not None:
+                    share = max(1, (TRIP_TREE_NODE_BUDGET - stats["realised"]) // (len(order) - d))
+                    over = lambda: tried >= share
+                else:
+                    over = lambda: time.monotonic() >= depth_stop
                 for k in range(width):
                     for state, taken, options in queues:
                         if k >= len(options):
                             continue
-                        if tried and time.monotonic() >= depth_stop:
+                        if tried and over():
                             break
                         self.checker.check_time(stop)
                         tried += 1
@@ -2303,28 +2558,51 @@ class Search:
                                                            "contacts": list(done)},
                                             depth0 + d + 1)
                         new_taken = taken | frozenset(done)
+                        errors.append(options[k][0] - (child.score - state.score))
                         children.append((child.score + rest_value(d + 1, new_taken), child,
                                          new_taken))
                         if best is None or child.score > best.score:
                             best = child
-                    if tried and time.monotonic() >= depth_stop:
+                    if tried and over():
                         stats["cut"] = stats.get("cut", 0) + 1
                         break
                 children.sort(key=lambda ch: -ch[0])
+                if TRIP_TREE_ADAPTIVE == "noise" and children:
+                    top = children[0][0]
+                    spread = statistics.pstdev(errors) if len(errors) >= 3 else 0.0
+                    margin = max(TRIP_TREE_MARGIN_MIN, TRIP_TREE_NOISE_K * spread)
+                    limit, floor = TRIP_TREE_MAX_WIDTH, top - margin
+                elif TRIP_TREE_ADAPTIVE and children:
+                    top = children[0][0]
+                    margin = max(TRIP_TREE_MARGIN_MIN, TRIP_TREE_MARGIN_FRAC * abs(top - prev_key))
+                    limit, floor = TRIP_TREE_MAX_WIDTH, top - margin
+                    prev_key = top
+                elif TRIP_TREE_SCHEDULE is not None:
+                    first, last = TRIP_TREE_SCHEDULE
+                    f = d / max(1, len(order) - 1)
+                    limit, floor = max(1, round(first + (last - first) * f)), -math.inf
+                else:
+                    limit, floor = TRIP_TREE_WIDTH, -math.inf
                 beam, keys = [], set()
-                for _, state, taken in children:
-                    key = state.signature()
+                for k, state, taken in children:
+                    if beam and k < floor:
+                        break
+                    key = taken if TRIP_TREE_DIVERSE else state.signature()
                     if key not in keys:
                         keys.add(key)
                         beam.append((state, taken))
-                    if len(beam) >= TRIP_TREE_WIDTH:
+                    if len(beam) >= limit:
                         break
+                stats["widths"].append(len(beam))
                 stats["depth"] = d + 1
         except DeadlineReached:
             pass
         for state, _ in beam:
             if best is None or state.score > best.score:
                 best = state
+        if errors:
+            stats["estimate_error"] = {"mean": round(statistics.fmean(errors), 2),
+                                       "stdev": round(statistics.pstdev(errors), 2)}
         stats.update(scouts=len(order), seconds=round(time.monotonic() - start, 3),
                      score=round(best.score, 3) if best is not None else None)
         self.trip_stats["tree"] = stats
@@ -2563,7 +2841,14 @@ class Search:
             # Small scenarios converge quickly; stopping early lowers the runtime tie-break.
             while st["since_best"] < 400:
                 self.checker.check_time()
-                self.lns_step(st, contacts, priorities)
+                try:
+                    self.lns_step(st, contacts, priorities)
+                except DeadlineReached:
+                    # A move's own short local deadline: only that move ends. Before this,
+                    # it ended the whole LNS (~5% of L4 runs stopped 20-30 s early).
+                    if time.monotonic() >= self.checker.stop:
+                        raise
+                    self.lns["local_timeouts"] = self.lns.get("local_timeouts", 0) + 1
         except DeadlineReached:
             if time.monotonic() >= self.stop:
                 raise
@@ -2711,6 +2996,7 @@ class Search:
                                                 "restarts": self.restarts},
                         **({"weights": dict(self.weights)} if self.adaptive else {})},
                 "trip_plan": dict(self.trip_stats),
+                "assign": dict(getattr(self, "assign_stats", {})),
                 "unserved": diagnostics["unserved"],
                 "unserved_points": diagnostics["unserved_points"],
                 "contacts": diagnostics["contacts"],

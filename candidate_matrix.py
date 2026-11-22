@@ -34,7 +34,8 @@ class CandidateMatrix:
 
     def refine(self, energy_wh):
         """Replace estimated costs by energy_wh(effector, contact) where it returns Wh
-        (e.g. the energy of the route the planner would build); None keeps the estimate."""
+        (e.g. the energy of the route the planner would build); None keeps the estimate,
+        math.inf marks the pair infeasible (groups() then ranks it last)."""
         for (aid, cid), cost in list(self.costs.items()):
             wh = energy_wh(aid, cid)
             if wh is not None:

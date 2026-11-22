@@ -267,6 +267,54 @@ Neither change helps alone. Together, on the board cases:
 
 On L4-402, zones block most ground lines, so its strikes fly at 30 m and a 45 m scout is still only 15 m above them.
 
+#### Effector assignment post-pass (`ASSIGN_PASS`)
+
+After LNS, the best plan's strikes are reassigned per subtype by a min-cost assignment (`min_cost_assignment`, a stdlib Hungarian algorithm). It uses the exact strike costs, and an effector counts as infeasible when it cannot arrive within the strike window. Teams that change are removed and rebuilt through `strikes()` with incremental validation. The result is kept only if the plan's score rises. The pass takes about 0.1 s; LNS stops `ASSIGN_S` (0.5 s) early to leave room for it. Stats are in `assign`.
+
+There is little left to gain. On board L4 final plans the estimated assignment gain was 5.6 (L4-401) and 0.1 (L4-402), and the realised gain was +1.5 on L4-401. Measured against each effector's cheapest first-choice route, the final plans overspend 7.2 (L4-401) and 10.0 (L4-402) on strikes in total. That excess comes mostly from L4-402's effectors at 85/130 m, which zones force there. The effector side, assignment and layers together, holds at most about 10–15 points per L4 case. Earlier estimates of 12–30 were measured against older plans.
+
+#### Visit-level model accuracy (`analysis/estimate_accuracy.py`)
+
+This harness measures the trip-search value model against single realised plan steps, with no planner runs. The trip packing is realised and snapshotted after ⅓ and ⅔ of its visits. In each snapshot, every scout gets up to 8 probes: the candidate contacts that the model's own straight-leg timing and battery check say it can still append. Each probe is one `realise_visit` call, which builds the scout visit and its strike with incremental validation. Realised net is the points gained minus (λ·Wh + c_eff) of the new effector routes, and 0 when the step fails. Each variant predicts net × `visit_keep`; `VISIT_LEARN` sees only earlier probes. The harness reports bias, mean absolute error and the Brier score of keep as the probability that the step realises. Runs take about 6 s per case and are deterministic.
+
+Board L4 cases, default model (exact strike costs, 45 m scouts):
+
+| | L4-401 (184 steps) | L4-402 (190 steps) |
+|---|---:|---:|
+| steps that fail | 12.5% (20 of 23: hostile, R8) | 3.7% |
+| model − realised net, realised steps only | 0.09 | 0.19 |
+| bias / MAE / Brier: base | 8.73 / 8.73 / 0.125 | 2.41 / 2.41 / 0.037 |
+| `SEP_RISK` | 8.20 / 9.11 / 0.128 | 0.18 / 3.99 / 0.041 |
+| `VISIT_LEARN` | 7.74 / 8.83 / 0.121 | 2.41 / 2.41 / 0.037 |
+| both | 7.22 / 9.22 / 0.123 | 0.18 / 3.99 / 0.041 |
+
+For single steps that realise, the value model is now almost exact. What remains is feasibility, and on L4-401 that is mostly hostile visits whose strike cannot be routed past the scouts already flying. `SEP_RISK` (observation points near strike lines) does not identify those steps. It discounts many visits that succeed, so its MAE and Brier are worse. `VISIT_LEARN` helps slightly where failures repeat. Both flags stay off. A better separation term would test the strike team's route against the current scout routes, which depends on the state.
+
+The first version of the harness omitted the battery check that the trip model applies. That made 29% of probes fail on scout R3, an artefact of the harness. While checking it, 41 (L4-401) and 123 (L4-402) effector/contact pairs turned out to be too slow for their window yet still priced as feasible. `STRIKE_COST_FALLBACKS` (off) marks those pairs infeasible and prices first-route failures by the first valid layer and angle.
+
+#### LNS stopping early (fixed)
+
+About 5% of L4 runs, in every version including the earlier master, ended LNS 20–30 s before the deadline after only a few iterations. When one move hit its own short local deadline, its `DeadlineReached` escaped `lns_step`. The LNS loop treated that as the end of LNS. Such runs were the low outliers; one was master's 1492 on L4-401. A local deadline now ends only that move, counted as `lns.local_timeouts`. After the fix, 32 L4 runs at 6 concurrent planners had none end early. L4-401 scored 1627.7 ± 10.7 (worst 1608.8) and L4-402 1160.8 ± 12.3. The means are unchanged; the spread on L4-401 halved.
+
+#### Trip tree width and time share (flags off)
+
+In the deterministic tree (uncapped packing, equal build budget, before LNS), the tree's result depends on width chaotically. On L4-401, widths 6, 9, 12 and 16 give 1472.7, 1403.8, 1552.4 and 1419.5. On L4-402 almost every setting gives 1153.6. Variants tried, all off by default:
+
+- `TRIP_TREE_ADAPTIVE = True`: margin scaled by the change in the best key. It matches width 12 (1551.7) with a third fewer builds.
+- `TRIP_TREE_ADAPTIVE = "noise"`: margin from the tree's own estimate errors, which have a spread of about 10–13 per trip. It narrows the first depths and loses (1467.7, 1131.5).
+- `TRIP_TREE_DIVERSE`: one node per set of held contacts. No effect.
+- `TRIP_TREE_SCHEDULE`: width falling with depth. 12 → 3 matches width 12 with 28% fewer builds; 16 → 4 and 24 → 2 are worse.
+
+Wider beams are often worse because nodes are ranked by real score plus an optimistic estimate for the remaining scouts. More width admits more nodes that look good only on that estimate. End to end (45 s, 6 concurrent, 4 runs each), the L4 total by tree share of the run was:
+
+| Tree's share of the run | fixed beam | adaptive (1.0, 10) |
+|---|---:|---:|
+| 10% | 2765.7 | 2763.7 |
+| 20% (default) | 2788.4 | 2764.7 |
+| 35% | 2793.9 | 2787.5 |
+
+At 10% the tree often does not finish. Between 20% and 35% the difference is within noise (about ±17). The adaptive beam does not win at any share.
+
 #### Joint re-plan of n scouts (LNS operator `group`)
 
 Moving one scout at a time stays in a local optimum. A model of the board L4 cases re-planned scouts one by one and reached the same contact set as the planner. Exchanging contacts between two scouts raised the model value by 60–80 per case. Most of that gain came from cheaper scout trips, not extra coverage. The `group` operator (`GROUP_SIZES`, `GROUP_SHARE` = 20% of LNS steps, alongside `trip`) works like this:
