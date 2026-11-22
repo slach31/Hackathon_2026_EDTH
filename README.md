@@ -332,6 +332,15 @@ Convergence (diagnostic 120 s run, beyond the official limit): LNS keeps improvi
 - `OBS_SIDE_ANGLE`: angle 0 places a hostile's observation point toward the scout's home, which is the shared base, so the scout waits on the line its own strike flies in on. At 90°, strike-vs-scout R8 rejections drop by 81% (L4-401) and 82% (L4-402). Failed single steps fall from 12.5% to 9.3% on L4-401, and lost visits in the packing from 221 to 93 on L4-402. 60° is much worse. End to end (6 runs each, L1–L3 2 each), the score did not change: L4-401 −0.8, L4-402 −8.6 (about 1 se), L1–L3 −1.6. The planner already worked around those conflicts with delays, angles and layers.
 - In final plans, collisions are the primary reason for few unserved contacts: 0 on L4-401 and about 2 per run on L4-402 (96 points before strike cost). Collateral bans (576 and 844 points) and windows no scout can reach (294 and 335) cannot be served by any plan.
 
+#### Strike timing (`ANALYTIC_STRIKE`, `STRIKE_LAYER_FIRST`, both off)
+
+`strikes()` loops delay, then angle, then layer set. When ground fails at delay 0, it tries 30 m and the 40/85/130 m rotations before trying ground at 4 s.
+
+- `ANALYTIC_STRIKE` times the first layer set at angle 0 analytically. For each piece pair that can come within d_sep (bounding boxes), the time shifts that bring it within d_sep form one interval, because the minimum distance is convex in the shift. Golden-section search and bisection find it, and the strike takes the smallest clear shift. Across 80,000 sampled shifts, the kit never found a conflict outside the predicted interval plus margin. In the deterministic tree on L4-401 it scored 1486.1 against 1472.7, with no strikes at 40–130 m (6 before), and 78% of attempts were accepted. End to end (6 runs) it cost LNS about 35% of its iterations: L4-401 +5.9, L4-402 −10.5.
+- `STRIKE_LAYER_FIRST` tries every delay and angle per layer set, cheapest first. It gives 10–20% more LNS iterations because fewer builds fail. A first 6-run batch gave L4-401 +23.6, but 10 more runs gave −0.2. Pooled over 16 runs each: L4-401 +8.7 (se 5.1), L4-402 +3.4 (se 3.2). L1–L3 (2 runs each) came to −4.2, including a reproducible −6.6 on L2-202.
+
+Neither is clearly better, so both stay off. Single 6-run batches can overstate a gain by 15 points or more; defaults need at least 16 runs per side.
+
 #### Joint re-plan of n scouts (LNS operator `group`)
 
 Moving one scout at a time stays in a local optimum. A model of the board L4 cases re-planned scouts one by one and reached the same contact set as the planner. Exchanging contacts between two scouts raised the model value by 60–80 per case. Most of that gain came from cheaper scout trips, not extra coverage. The `group` operator (`GROUP_SIZES`, `GROUP_SHARE` = 20% of LNS steps, alongside `trip`) works like this:

@@ -1166,6 +1166,121 @@ FAST_R8 = True
 FAST_R8_SLACK_M = 1e-3
 
 
+# Strike timing (both off). ANALYTIC_STRIKE: before the delay grid, the first layer set at
+# angle 0 is timed analytically: for every piece pair that can come within d_sep (bounding
+# boxes), the time shifts that bring it within d_sep form one interval (convex in the shift);
+# the strike takes the smallest shift outside all of them and is validated as usual.
+# STRIKE_LAYER_FIRST: try the delay grid per layer set (cheapest first) instead of per delay.
+ANALYTIC_STRIKE = False
+STRIKE_LAYER_FIRST = False
+STRIKE_SHIFT_MARGIN_S = 0.25
+STRIKE_SHIFT_ITERS = 22      # golden-section / bisection steps (0.25 s margin needs ~20)
+
+
+def _piece_gap2(a, b, shift):
+    """Min squared distance between piece a shifted by `shift` and piece b over their common
+    time, or None without common time. Pieces are fast_pieces tuples."""
+    lo = a[0] + shift
+    if b[0] > lo:
+        lo = b[0]
+    hi = a[1] + shift
+    if b[1] < hi:
+        hi = b[1]
+    if hi - lo < 0.0:
+        return None
+    ta, tb = lo - a[0] - shift, lo - b[0]
+    rx = b[2] + b[5] * tb - a[2] - a[5] * ta
+    ry = b[3] + b[6] * tb - a[3] - a[6] * ta
+    rz = b[4] + b[7] * tb - a[4] - a[7] * ta
+    wx, wy, wz = b[5] - a[5], b[6] - a[6], b[7] - a[7]
+    qa = wx * wx + wy * wy + wz * wz
+    t = 0.0
+    if qa > 1e-12:
+        t = -(rx * wx + ry * wy + rz * wz) / qa
+        t = 0.0 if t < 0.0 else (hi - lo if t > hi - lo else t)
+    x, y, z = rx + wx * t, ry + wy * t, rz + wz * t
+    return x * x + y * y + z * z
+
+
+def shift_conflict(a, b, d):
+    """Open interval of shifts of piece a that bring it within d of piece b, or None.
+    The min distance over common time is convex in the shift, so the set is one interval."""
+    lo, hi = b[0] - a[1], b[1] - a[0]
+    if hi - lo < 1e-9:
+        return None
+    d2 = d * d
+    g = lambda x: _piece_gap2(a, b, x)
+    # golden-section search for the closest shift
+    r = 0.6180339887498949
+    x1, x2 = hi - r * (hi - lo), lo + r * (hi - lo)
+    f1, f2 = g(x1), g(x2)
+    f1 = math.inf if f1 is None else f1
+    f2 = math.inf if f2 is None else f2
+    a_, b_ = lo, hi
+    for _ in range(STRIKE_SHIFT_ITERS):
+        if f1 < f2:
+            b_, x2, f2 = x2, x1, f1
+            x1 = b_ - r * (b_ - a_)
+            f1 = g(x1)
+            f1 = math.inf if f1 is None else f1
+        else:
+            a_, x1, f1 = x1, x2, f2
+            x2 = a_ + r * (b_ - a_)
+            f2 = g(x2)
+            f2 = math.inf if f2 is None else f2
+    best = (a_ + b_) / 2.0
+    fb = g(best)
+    if fb is None or fb >= d2:
+        return None
+
+    def edge(inside, outside):
+        for _ in range(STRIKE_SHIFT_ITERS):
+            m = (inside + outside) / 2.0
+            v = g(m)
+            if v is not None and v < d2:
+                inside = m
+            else:
+                outside = m
+        return outside
+    return edge(best, lo), edge(best, hi)
+
+
+def free_shift(own, others, d, lo, hi, margin):
+    """Smallest shift in [lo, hi] for which no piece of the `own` routes (fast_pieces lists)
+    comes within d of the `others` (fast_pieces lists with their bounding boxes); None if
+    every shift in the range conflicts."""
+    bad = []
+    for pieces in own:
+        for a in pieces:
+            ax0, ax1 = min(a[2], a[2] + a[5] * (a[1] - a[0])), max(a[2], a[2] + a[5] * (a[1] - a[0]))
+            ay0, ay1 = min(a[3], a[3] + a[6] * (a[1] - a[0])), max(a[3], a[3] + a[6] * (a[1] - a[0]))
+            az0, az1 = min(a[4], a[4] + a[7] * (a[1] - a[0])), max(a[4], a[4] + a[7] * (a[1] - a[0]))
+            for box, opieces in others:
+                if (ax0 - box[1] >= d or box[0] - ax1 >= d or ay0 - box[3] >= d
+                        or box[2] - ay1 >= d or az0 - box[5] >= d or box[4] - az1 >= d):
+                    continue
+                for b in opieces:
+                    bx0, bx1 = sorted((b[2], b[2] + b[5] * (b[1] - b[0])))
+                    by0, by1 = sorted((b[3], b[3] + b[6] * (b[1] - b[0])))
+                    bz0, bz1 = sorted((b[4], b[4] + b[7] * (b[1] - b[0])))
+                    if (ax0 - bx1 >= d or bx0 - ax1 >= d or ay0 - by1 >= d or by0 - ay1 >= d
+                            or az0 - bz1 >= d or bz0 - az1 >= d):
+                        continue
+                    if b[0] - a[1] > hi + margin or b[1] - a[0] < lo - margin:
+                        continue
+                    iv = shift_conflict(a, b, d)
+                    if iv is not None:
+                        bad.append((iv[0] - margin, iv[1] + margin))
+    bad.sort()
+    x = lo
+    for s0, s1 in bad:
+        if s0 > x:
+            break
+        if s1 > x:
+            x = s1
+    return x if x <= hi else None
+
+
 def fast_pieces(pieces):
     """(t0, t1, x0, y0, z0, vx, vy, vz) per kit piece (t0, t1, p0, p1)."""
     out = []
@@ -1537,6 +1652,7 @@ class Search:
         self._trip_cache = {}
         self.trip_stats = {}
         self._strike_lines = None
+        self.analytic_stats = {}
         self.visit_outcomes = {}     # (scout, contact, layer) -> (realised, attempts)
         self.lns_share = lns_share
         self.interleave, self.adaptive, self.restarts = interleave, adaptive, restarts
@@ -1821,8 +1937,17 @@ class Search:
             found = False
             spacing = min(5.0, self.sc.rules.sync_window_s / max(1, len(team)-1))
             delays = STRIKE_DELAYS if PAD_TAKEOFFS else (0.0, 8.0, 20.0, 45.0, 90.0)
-            for delay, angle, layers in itertools.product(delays, (0.0, 35.0, -35.0),
-                                                             effector_layer_sets()):
+            if ANALYTIC_STRIKE:
+                candidate = self.analytic_strike(parent, contact, team, scout, scout_route,
+                                                 base, spacing, stats)
+                if candidate is not None:
+                    yield candidate, team
+                    continue
+            combos = itertools.product(delays, (0.0, 35.0, -35.0), effector_layer_sets())
+            if STRIKE_LAYER_FIRST:
+                combos = ((dl, an, ly) for ly in effector_layer_sets()
+                          for dl in delays for an in (0.0, 35.0, -35.0))
+            for delay, angle, layers in combos:
                 self.checker.check_time(stop)
                 arrive = base + delay
                 if arrive + spacing*(len(team)-1) > contact.window[1] + EPS:
@@ -1852,6 +1977,59 @@ class Search:
                     found = True
                 if found:
                     break
+
+    def analytic_strike(self, parent, contact, team, scout, scout_route, base, spacing, stats):
+        """ANALYTIC_STRIKE: the team on the first layer set at angle 0, arriving at the
+        smallest shift past `base` that clears the plan's routes (R8 geometry); validated.
+        Returns the child state or None."""
+        layers = effector_layer_sets()[0]
+        n = len(team)
+        latest = contact.window[1] - spacing * (n - 1)
+        if latest < base - EPS:
+            return None
+        routes = {}
+        for i, eff in enumerate(team):
+            route, earliest = effector_route(eff, contact, base + spacing * i,
+                                             layers[i % len(layers)], 0.0, self.sc)
+            if route is None:
+                return None
+            routes[eff.id] = route
+        own = []
+        for aid, route in routes.items():
+            info = self.checker.route_info(aid, route)
+            if info[2] or info[3] is None:
+                return None
+            own.append(fast_pieces(info[3][1]))
+        others = []
+        sinfo = self.checker.route_info(scout.id, scout_route)
+        for aid, info in parent.infos.items():
+            if aid == scout.id or info[3] is None:
+                continue
+            others.append((info[3][5], self.checker.fast_item((info[0], info[3]))))
+        if sinfo[3] is not None and not sinfo[2]:
+            others.append((sinfo[3][5], self.checker.fast_item((sinfo[0], sinfo[3]))))
+        shift = free_shift(own, others, self.sc.rules.d_sep_m, 0.0, latest - base,
+                           STRIKE_SHIFT_MARGIN_S)
+        st = self.analytic_stats
+        st["tried"] = st.get("tried", 0) + 1
+        if shift is None:
+            st["no_shift"] = st.get("no_shift", 0) + 1
+            return None
+        st["shift_sum"] = st.get("shift_sum", 0.0) + shift
+        extra = {scout.id: scout_route}
+        for i, eff in enumerate(team):
+            route, _ = effector_route(eff, contact, base + shift + spacing * i,
+                                      layers[i % len(layers)], 0.0, self.sc)
+            if route is None:
+                return None
+            extra[eff.id] = route
+        if PAD_TAKEOFFS and pad_conflict(self.sc, self.aircraft, parent.routes,
+                                         {aid: r for aid, r in extra.items() if aid != scout.id}):
+            return None
+        child = self.checker.extend(parent, extra)
+        key = "accepted" if child is not None else "rejected:" + str(self.checker.last_rule)
+        st[key] = st.get(key, 0) + 1
+        return child
 
     def strike_route_options(self, contact, groups, scout, scout_route, obs_end, stop):
         """A small, concrete sample of the routes ``strikes`` will try.
