@@ -41,7 +41,7 @@ def main():
                         help="search deadline including startup (default 45, capped at 55 seconds)")
     parser.add_argument("--top-n", type=int, default=5)
     parser.add_argument("--beam-width", type=int, default=6)
-    parser.add_argument("--lns-share", type=float, default=0.4,
+    parser.add_argument("--lns-share", type=float, default=0.75,
                         help="final share of the search budget spent repairing the best plan (0..1)")
     parser.add_argument("--interleave", action="store_true",
                         help="alternate beam passes with LNS bursts instead of LNS only at the end")
