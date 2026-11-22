@@ -872,6 +872,27 @@ class TripPlanTests(unittest.TestCase):
         if state is not None:
             self.assertTrue(evaluate(sc, state.plan(sc.seed)).valid)
 
+    def test_trip_tree_completes_with_valid_scored_nodes(self):
+        sc = Scenario.from_dict(generate('L4', 9))
+        search = Search(sc, seconds=20)
+        search.matrix = CandidateMatrix(sc)
+        search.repair = lambda state, depth: state
+        start = time.monotonic()
+        state = search.trip_plan(start + 6.0)
+        self.assertLess(time.monotonic() - start, 7.0)
+        tree = search.trip_stats['tree']
+        # Anytime: every scout depth is reached within the stop.
+        self.assertEqual(tree['depth'], tree['scouts'])
+        self.assertGreater(tree['nodes'], 0)
+        self.assertGreaterEqual(state.score, search.trip_stats['realised_score'] - 1e-9)
+        nodes = [s for s in search.archive]
+        self.assertTrue(any(n['decision'].get('kind') == 'trip_tree' for n in search.trace
+                            if isinstance(n['decision'], dict)))
+        for s in nodes + [state]:
+            result = evaluate(sc, s.plan(sc.seed))
+            self.assertTrue(result.valid)
+            self.assertAlmostEqual(result.score, s.score, places=6)
+
 
 class GroupTests(unittest.TestCase):
     """Joint re-plan of n scouts (LNS operator "group")."""

@@ -194,6 +194,29 @@ Same-run comparisons, 17 scenarios (8 board validation, L4 seeds 9–14, L3 seed
 
 Repeat runs of the same code differ by 0.4–1% in total; in a third run the committed version scored 14027.9. Step 2's gain over step 1 comes mostly from two large wins (L4-11 +104, L4-14 +53); it won 9 cases and lost 6. Under 4 parallel workers the trip plan reaches its time cap before realisation finishes on the largest cases. Two variants scored lower in the same run: capping generation at 40% of the share (−37) and generating at one layer only (−133).
 
+#### Validated trip tree (`TRIP_TREE`)
+
+The packing picks one combination of trips by estimated value, and only that one is realised. On the board L4 cases that combination lost 6–12% when realised (L4-401: estimate 1623, realised 1436; L4-402: 1213 to 1084). The trip tree searches combinations of the same pregenerated trips with validated nodes:
+
+- one depth per scout, scouts with the most valuable packed trip first;
+- each node's children are the scout's best trips that are disjoint from the node's contacts. These are ranked by trip value plus a greedy estimate for the remaining scouts. The packed trip and "no trip" are always options;
+- each child is realised through `_serve` (strikes included) and incrementally validated. The beam (`TRIP_TREE_WIDTH` 6, `TRIP_TREE_BRANCH` 5) ranks nodes by real score plus the remaining-scout estimate, scaled by the packing's realised/estimated ratio;
+- it is anytime: each depth gets an equal share of the remaining time, and options are tried round-robin across the beam, so a complete plan is always reached. The best of the tree and the realised packing is repaired as before. The warm-start share is `TRIP_TREE_SHARE` (45% of the beam phase).
+
+Every node is a valid plan with an official score, and node validation is cheap because `route_info` and R8 pair results are memoised across siblings. A full tree on L4 costs about 3.5 s, about 230 realised nodes. Stats are in `trip_plan.tree`.
+
+The first version kept only each scout's top 20 trips. Those overlap the contacts earlier scouts had already taken, so the estimate collapsed to zero and the beam collapsed to 3 nodes. A fixed-width version without time shares reached only depth 5 of 15 under load and lost 25 points on L4-401.
+
+Same-run comparison, 12 concurrent planners on 12 cores, default 45 s, all plans valid. "Off" is the same code with `TRIP_TREE = False`:
+
+| Case | off | tree | Δ |
+|---|---:|---:|---:|
+| L4-401 (6 off / 3 tree runs) | 1577.3 | 1600.0 | +22.7 |
+| L4-402 (6 / 3) | 1136.0 | 1147.4 | +11.4 |
+| L1–L3 board cases, 1 run each | 2215.4 | 2213.4 | −1.9 |
+
+Run-to-run spread on L4 is about ±30, so the L4-402 gain and the L1–L3 difference are within noise.
+
 #### Joint re-plan of n scouts (LNS operator `group`)
 
 Moving one scout at a time stays in a local optimum. A model of the board L4 cases re-planned scouts one by one and reached the same contact set as the planner. Exchanging contacts between two scouts raised the model value by 60–80 per case. Most of that gain came from cheaper scout trips, not extra coverage. The `group` operator (`GROUP_SIZES`, `GROUP_SHARE` = 20% of LNS steps, alongside `trip`) works like this:

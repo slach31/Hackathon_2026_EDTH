@@ -98,6 +98,19 @@ GROUND_Z = 0.0
 GROUND_CLEARANCE_M = 1.0
 
 
+# Strike team arrival order. Members arrive `spacing` s apart in team order; on a shared
+# line from the common base a faster member arriving after a slower one closes on it and
+# breaks separation, pushing the team up to 30/40-130 m. Slowest first: gaps only grow.
+SLOWEST_FIRST = True
+
+
+def arrival_order(team):
+    """Team members in the order they arrive at the target."""
+    if not SLOWEST_FIRST:
+        return tuple(team)
+    return tuple(sorted(team, key=lambda a: (a.v_h_mps, a.id)))
+
+
 def effector_layer_sets():
     """Layer sets tried for a strike team, in order."""
     return (((GROUND_Z,),) + EFFECTOR_Z) if GROUND_STRIKES else EFFECTOR_Z
@@ -781,6 +794,17 @@ TRIP_PLAN_ROUNDS = 2     # re-plan each scout around the others' chosen trips, r
 TRIP_PLAN_LABELS = 4     # labels kept per contact while generating plan trips
 TRIP_PLAN_EXACT = False  # plan trips use straight legs (detours are ~95% of the label time)
 TRIP_PLAN_DROPS = 2      # extra searches per scout without one of its best trip's contacts
+# Validated trip tree on top of the packing. Depth = one scout (best packed trip first);
+# a node's children are that scout's best disjoint pregenerated trips (ranked by trip
+# value + a greedy estimate for the scouts after it), the packed trip, and "no trip".
+# Each child is realised through _serve and incrementally validated, so nodes carry real
+# scores; the beam keeps TRIP_TREE_WIDTH nodes per depth by real score + the estimate of
+# the scouts still to come. The best realised plan (tree or packing) is then repaired.
+TRIP_TREE = True
+TRIP_TREE_WIDTH = 6      # nodes kept per depth
+TRIP_TREE_BRANCH = 5     # trips tried per node (plus the packed trip and "no trip")
+TRIP_TREE_POOL = 30      # a scout's best disjoint trips ranked for branching
+TRIP_TREE_SHARE = 0.45   # warm-start share of the beam phase when the tree is on
 
 
 def pack_trips(trips, stop=None):
@@ -1572,6 +1596,7 @@ class Search:
         # Try cheap alternatives to the nearest team. At most one child per team
         # for each scout setting, avoiding a beam filled with timing variants.
         for team in groups:
+            team = arrival_order(team)
             found = False
             spacing = min(5.0, self.sc.rules.sync_window_s / max(1, len(team)-1))
             delays = STRIKE_DELAYS if PAD_TAKEOFFS else (0.0, 8.0, 20.0, 45.0, 90.0)
@@ -1617,6 +1642,7 @@ class Search:
         base = max(obs_end + self.sc.rules.confirm_margin_s + 2.0, contact.window[0])
         count = 0
         for team in groups:
+            team = arrival_order(team)
             spacing = min(5.0, self.sc.rules.sync_window_s / max(1, len(team) - 1))
             for delay, angle, layers in itertools.product(STRIKE_DELAYS, (0.0, 35.0, -35.0),
                                                             effector_layer_sets()):
@@ -1782,7 +1808,8 @@ class Search:
         rng = random.Random(self.sc.seed)
         self.checker.stop = min(self.beam_stop, self.stop)
         if TRIP_PLAN and contacts:
-            share = TRIP_PLAN_SHARE * max(0.0, self.beam_stop - self.start)
+            share = ((TRIP_TREE_SHARE if TRIP_TREE else TRIP_PLAN_SHARE)
+                     * max(0.0, self.beam_stop - self.start))
             try:
                 self.trip_plan(min(self.checker.stop, time.monotonic() + share))
             except DeadlineReached:
@@ -2070,6 +2097,11 @@ class Search:
                                           stop, on_visit)
         self.trip_stats.update(visits=len(visits), realised=len(done),
                                realised_score=round(state.score, 3))
+        if TRIP_TREE:
+            ratio = min(1.0, max(0.5, state.score / value)) if value > 0 else 1.0
+            tree = self.trip_tree(unique, chosen, stop, depth[0], ratio)
+            if tree is not None and tree.score > state.score:
+                state = tree
         saved, self.checker.stop = self.checker.stop, min(self.checker.stop, stop)
         try:
             state = self.repair(state, depth[0])
@@ -2080,6 +2112,106 @@ class Search:
         self.trip_stats.update(score=round(state.score, 3),
                                seconds=round(time.monotonic() - start, 3))
         return state
+
+    def trip_tree(self, unique, chosen, stop, depth0, ratio=1.0):
+        """Beam over whole pregenerated scout trips with validated nodes (TRIP_TREE).
+        Returns the best realised state, or None when nothing was realised."""
+        start = time.monotonic()
+        by_scout = {}
+        for tr in unique.values():
+            if tr[0] > 0:
+                by_scout.setdefault(tr[1], []).append(tr)
+        for trips in by_scout.values():
+            trips.sort(key=lambda tr: (-tr[0], tuple(sorted(tr[2]))))
+        packed = {tr[1]: tr for tr in chosen}
+        order = sorted(by_scout, key=lambda sid: (-packed[sid][0] if sid in packed else 0.0,
+                                                  -by_scout[sid][0][0], sid))
+        stats = {"nodes": 0, "realised": 0, "depth": 0}
+
+        def rest_value(d, taken):
+            """Greedy estimate for scouts order[d:]: each takes its best disjoint trip,
+            scaled by the packing's realised/estimated ratio (estimates are optimistic)."""
+            total, taken = 0.0, set(taken)
+            for sid in order[d:]:
+                for tr in by_scout[sid]:
+                    if not tr[2] & taken:
+                        total += tr[0]
+                        taken |= tr[2]
+                        break
+            return ratio * total
+
+        beam = [(self.root, frozenset())]
+        best = None
+        seen = set()
+        try:
+            for d, sid in enumerate(order):
+                scout = self.aircraft[sid]
+                # Anytime: each depth gets an equal share of the time left, so the tree
+                # always reaches a complete plan; options are tried round-robin over the
+                # beam, best first, and at least one trip is realised per depth.
+                depth_stop = time.monotonic() + max(0.0, stop - time.monotonic()) / (len(order) - d)
+                children, queues = [], []
+                for state, taken in beam:
+                    pool = [tr for tr in by_scout[sid] if not tr[2] & taken][:TRIP_TREE_POOL]
+                    pool.sort(key=lambda tr: -(tr[0] + rest_value(d + 1, taken | tr[2])))
+                    options = pool[:TRIP_TREE_BRANCH]
+                    mine = packed.get(sid)
+                    if mine is not None and mine not in options and not mine[2] & taken:
+                        options.append(mine)
+                    # "No trip": the scout stays home and its contacts stay free.
+                    children.append((state.score + rest_value(d + 1, taken), state, taken))
+                    queues.append((state, taken, options))
+                width = max((len(q[2]) for q in queues), default=0)
+                tried = 0
+                for k in range(width):
+                    for state, taken, options in queues:
+                        if k >= len(options):
+                            continue
+                        if tried and time.monotonic() >= depth_stop:
+                            break
+                        self.checker.check_time(stop)
+                        tried += 1
+                        z, trip, _ = options[k][3]
+                        child, done = self.realise_visits(state, [(scout, cid, z) for cid in trip],
+                                                          stop)
+                        stats["realised"] += 1
+                        if not done:
+                            continue
+                        sig = child.signature()
+                        if sig in seen:
+                            continue
+                        seen.add(sig)
+                        stats["nodes"] += 1
+                        child = self.record(child, state, {"kind": "trip_tree", "scout": sid,
+                                                           "contacts": list(done)},
+                                            depth0 + d + 1)
+                        new_taken = taken | frozenset(done)
+                        children.append((child.score + rest_value(d + 1, new_taken), child,
+                                         new_taken))
+                        if best is None or child.score > best.score:
+                            best = child
+                    if tried and time.monotonic() >= depth_stop:
+                        stats["cut"] = stats.get("cut", 0) + 1
+                        break
+                children.sort(key=lambda ch: -ch[0])
+                beam, keys = [], set()
+                for _, state, taken in children:
+                    key = state.signature()
+                    if key not in keys:
+                        keys.add(key)
+                        beam.append((state, taken))
+                    if len(beam) >= TRIP_TREE_WIDTH:
+                        break
+                stats["depth"] = d + 1
+        except DeadlineReached:
+            pass
+        for state, _ in beam:
+            if best is None or state.score > best.score:
+                best = state
+        stats.update(scouts=len(order), seconds=round(time.monotonic() - start, 3),
+                     score=round(best.score, 3) if best is not None else None)
+        self.trip_stats["tree"] = stats
+        return best
 
     def trip_move(self, current, rng):
         """Destroy and rebuild one scout's whole tour from its best label-search trip.
