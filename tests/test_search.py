@@ -443,9 +443,109 @@ class LnsTests(unittest.TestCase):
                     self.assertGreater(len(bursts), 1)
                     self.assertTrue(all(b is not None and b <= search.stop for b in bursts[:-1]))
                 else:
-                    self.assertEqual(bursts, [None])
+                    # One final LNS call, ending at (or just before) the search deadline.
+                    self.assertEqual(len(bursts), 1)
+                    self.assertTrue(bursts[0] is None or bursts[0] <= search.stop)
                 if 'adaptive' in flags:
                     self.assertNotEqual(set(report['weights'].values()), {1.0})
+
+
+class ScoutTourTests(unittest.TestCase):
+    def search(self, sc, seconds=5.0):
+        search = Search(sc, seconds=seconds)
+        search.matrix = CandidateMatrix(sc)
+        search.searchable = [c for c in sc.contacts if c.window is not None
+                             and c.id not in search.matrix.banned]
+        return search
+
+    def test_incremental_verdicts_match_official_validator(self):
+        # Every candidate judged during a real search: same validity and score as evaluate().
+        sc = Scenario.from_dict(generate('L3', 302))
+        compared = []
+        original = IncrementalValidator._extend
+
+        def checked(checker, parent, extra):
+            out = original(checker, parent, extra)
+            if len(compared) < 400:
+                routes = {**parent.routes, **extra}
+                plan = {'seed': sc.seed, 'routes': [{'aircraft': a, 'waypoints': r}
+                                                    for a, r in routes.items()]}
+                result = evaluate(sc, plan)
+                compared.append((result.valid, out is not None,
+                                 abs(result.score - out.score) if out is not None and result.valid else 0.0))
+            return out
+
+        IncrementalValidator._extend = checked
+        try:
+            Search(sc, seconds=4.0).run()
+        finally:
+            IncrementalValidator._extend = original
+        self.assertGreater(len(compared), 100)
+        self.assertTrue(any(valid for valid, _, _ in compared))
+        self.assertTrue(any(not valid for valid, _, _ in compared))
+        for official, incremental, score_diff in compared:
+            self.assertEqual(official, incremental)
+            self.assertLess(score_diff, 1e-6)
+
+    def test_removing_a_confirming_scout_is_rejected(self):
+        # without() must make extend() recheck R4 for the contacts the removed tour observed.
+        sc = scenario()
+        search = Search(sc, seconds=10)
+        search.run()
+        state = next(s for s in search.archive if s.served)
+        scouts = [aid for aid in state.routes if aid.startswith('scout')]
+        self.assertTrue(scouts)
+        smaller = search.checker.extend(search.checker.without(state, set(scouts)), {})
+        self.assertIsNone(smaller)
+        self.assertEqual(search.checker.last_rule, 'R4')
+
+    def test_scout_options_never_visit_a_contact_twice(self):
+        sc = Scenario.from_dict(generate('L2', 7))
+        search = Search(sc, seconds=3.0)
+        best = search.run()[0][0]
+        for contact in sc.contacts:
+            if contact.window is None or contact.id not in {t['cid'] for ts in best.tasks.values() for t in ts}:
+                continue
+            for _, tasks, _ in search.scout_options(best, contact, True):
+                cids = [t['cid'] for t in tasks]
+                self.assertEqual(len(cids), len(set(cids)))
+
+    def test_idle_scouts_get_tours(self):
+        sc = scenario()
+        search = self.search(sc)
+        state, _ = search.fill_idle(search.root, 0, time.monotonic() + 3.0)
+        self.assertTrue(state.served)
+        self.assertTrue(evaluate(sc, state.plan(sc.seed)).valid)
+        self.assertAlmostEqual(evaluate(sc, state.plan(sc.seed)).score, state.score)
+
+    def test_construct_records_valid_plans(self):
+        sc = Scenario.from_dict(generate('L3', 1))
+        search = self.search(sc)
+        search.construct(time.monotonic() + 3.0)
+        kinds = {n['decision'].get('kind') for n in search.trace if isinstance(n['decision'], dict)}
+        self.assertIn('anchor', kinds)
+        for state in search.archive:
+            self.assertTrue(evaluate(sc, state.plan(sc.seed)).valid)
+
+    def test_prune_drops_useless_visits(self):
+        # A tour with an extra visit of an already observed unknown loses it and saves energy.
+        sc = Scenario.from_dict(generate('L2', 7))
+        search = Search(sc, seconds=3.0)
+        best = search.run()[0][0]
+        sid, tasks = next((sid, ts) for sid, ts in best.tasks.items() if ts and sid in best.routes)
+        route = best.routes[sid]
+        doubled = tasks + [dict(tasks[0])]
+        tour = scout_tour(sc, search.aircraft[sid], doubled, route[1]['z'], depart=route[0]['t'])
+        if tour is None:
+            self.skipTest('doubled tour does not fit this scenario')
+        heavier = search.checker.extend(best, {sid: tour})
+        if heavier is None:
+            self.skipTest('doubled tour breaks a rule in this scenario')
+        heavier.tasks = {**best.tasks, sid: doubled}
+        pruned = search.prune(heavier, 0)
+        self.assertGreater(pruned.score, heavier.score)
+        self.assertEqual(len(pruned.tasks[sid]), len(tasks))
+        self.assertTrue(evaluate(sc, pruned.plan(sc.seed)).valid)
 
 
 if __name__ == '__main__':

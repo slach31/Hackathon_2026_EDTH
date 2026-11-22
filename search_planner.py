@@ -15,7 +15,7 @@ from fleetkit import baseline
 from fleetkit.baseline import (_Planner, _effector_route, _scout_route, EFFECTOR_LAYERS,
                                SCOUT_LAYERS, SPEED_FACTOR)
 from fleetkit.energy import best_range_speed, route_energy_wh
-from fleetkit.geometry import EPS, hdist
+from fleetkit.geometry import EPS, INF, hdist
 from fleetkit.model import HOSTILE, SCOUT, UNKNOWN, parse_plan
 from fleetkit.scorer import evaluate
 from fleetkit import validator as rules
@@ -34,26 +34,83 @@ SCOUT_FANOUT = 4        # scouts tried first for a contact
 SCOUT_FALLBACK = 8      # scouts tried when none of the first SCOUT_FANOUT gives a valid child
 FULL_INSERT_TASKS = 4   # tours up to this long try every insertion position, not only 3
 REORDER_TASKS = 6       # tours up to this long also try deadline- and start-ordered tours
+# Search limits. The hand-in keeps these; offline board runs (analysis/board_search.py)
+# raise them for longer searches.
+MAX_SEARCH_S = 55.0     # cap on the search deadline, from startup
+LNS_PATIENCE = 400      # LNS iterations without a new best before LNS stops early
+TRACE_CAP = 20000       # recorded nodes after which beam passes stop
+VARIANT_SEED_STRIDE = 1000003  # random seed offset per search variant
+# Scout observation altitudes. Low tours climb less and observe from further away (the 3D
+# observation range allows ~138 m horizontally at 35 m, ~125 m at 70 m).
+SCOUT_ALTITUDES = (30.5, 70.0)
+# Low strike routes: pad straight to the engagement point; detour waypoints (around zones)
+# fly at this altitude, since R2 requires z >= z_min at every waypoint but the last.
+LOW_DETOUR_Z = 32.0
+# Low strikes engage at ground level over the contact: R2 allows z = 0 at the last waypoint
+# and R10 only needs the engagement within R_eng (3D) of the contact; no climb energy.
+LOW_ENGAGE_Z = 0.0
+# Alternative low strikes cross at this altitude (above scouts at 30.5 m by > d_sep) and
+# dive over the last LOW_CROSS_M metres.
+LOW_CROSS_Z = 72.0
+LOW_CROSS_M = 150.0
+# LNS scout rebuilds: share of iterations, and time to regrow the emptied tour.
+# Measured on L4-402 (90 s from the best plan): rebuilds were accepted 7 times in ~160
+# tries with changes of -3..+4 points, and a full repair after each rebuild made it worse
+# (3 accepted, half the LNS iterations). Kept rare so it costs little.
+SCOUT_REBUILD_P = 0.1
+SCOUT_REBUILD_S = 1.5   # per rebuilt scout
+SCOUT_REBUILD_SIZES = (1, 2, 2, 3)  # scouts cleared together per rebuild (drawn uniformly)
+# Arrival shifts tried when re-flying a strike (the team's 20 s sync window still applies).
+REFLY_SHIFTS_S = (0.0, 3.0, -3.0, 7.0, -7.0)
+# Joint scout planning: share of the beam phase, candidate tours per scout, contacts tried
+# per insertion step, and ranking noise of the randomised tours.
+JOINT_SHARE = 0.85
+JOINT_BUILDS = 3      # distinct candidate plans built per run; the best result is kept
+JOINT_PATIENCE = 150  # restarts without a better plan before the joint planner stops early
+JOINT_TOURS_PER_SCOUT = 12
+JOINT_NEIGHBOURS = 6
+JOINT_NOISE = 0.5
+JOINT_SLACK_S = 20.0   # generated tours end this long before the horizon
+# Building chosen tours: altitude layers 40 m apart (R8 cannot fail between layers) and
+# departure delays, tried in order until the validator accepts the route.
+JOINT_BUILD_ALTITUDES = (30.5, 70.5, 110.5)
+JOINT_BUILD_SHIFTS = (0.0, 5.0, 10.0, 20.0, 35.0, 50.0)
+# Scout-first construction (sector tours) and idle-scout tours.
+CONSTRUCT_SHARE = 0.0  # share of the beam phase spent on scout-first construction
+GROW_CANDIDATES = 6     # contacts tried per step when growing one scout's tour
+GROW_CONTACT_S = 0.25   # time cap per contact tried while growing a tour
+REPAIR_SHARE = 0.35     # share of the LNS phase for observation cleanup, idle tours and repair
+POLISH_RESERVE_S = 0.4  # kept before the deadline to clean up the best plans' tours
 # Rebuilt tours keep earlier visits within a few seconds of the parent's (other altitude or
 # departure shift); the reachability bound subtracts this much from the parent's times.
 REACH_SLACK_S = 20.0
 
 _tours = {}
 
+
+def evict(cache):
+    """Drop the oldest tenth of a full cache. Clearing a cache of ~200k parsed routes at
+    once stalls the process for seconds (deallocation), which can push a run past the
+    deadline; evicting in small steps spreads that cost."""
+    for key in list(itertools.islice(cache, max(1, len(cache) // 10))):
+        del cache[key]
+
 # Scout cruise speed. The kit flies scouts at min(0.95 v_h, best-range speed). Energy per
 # metre is flat near the best-range speed (on L4, 0.98 v_h costs +0-1.5% per metre) while
 # airtime, hence hover-free p0 energy, R1 (home by the horizon) and window reach, improve
 # by 5-35%. For scouts whose best-range speed exceeds 0.95 v_h the kit speed is both slower
-# and dearer. R2 allows v_h exactly; 0.98 keeps a 2% margin.
-SCOUT_CRUISE = 0.98
+# and dearer. R2 allows v_h exactly; 0.998 v_h plus 0.01 s per leg absorbs waypoint
+# rounding. The last 2% decides whether early-window contacts ~5 km out can be confirmed.
+SCOUT_CRUISE = 0.998
 # "fast": every scout leg at SCOUT_CRUISE * v_h. "eco": the kit's speed. "hybrid": the kit's
 # speed, falling back to fast when the eco tour misses a window, the horizon or the battery.
 # Set per run by Search(scout_speed=...); planner.py --scout-speed.
 SCOUT_SPEEDS = ("fast", "eco", "hybrid")
 SCOUT_SPEED_MODE = "fast"
 # Contacts are on the ground; the 3D observation range allows a horizontal offset of
-# sqrt(R_obs^2 - z^2): ~133 m at 70 m, ~102 m at 110 m. The kit always uses 100 m.
-OBS_MARGIN_M = 8.0
+# sqrt(R_obs^2 - z^2): ~147 m at 30.5 m, ~133 m at 70 m. The kit always uses 100 m. The
+# validator checks the 3D distance at the waypoint (+1e-6); 5 cm covers 1 mm rounding.
+OBS_MARGIN_M = 0.05
 # Set per run by Search(obs_stretch=...); planner.py --obs-stretch / --no-obs-stretch.
 OBS_STRETCH = True
 
@@ -83,17 +140,26 @@ def obs_point(scenario, scout, contact, angle, z):
     return contact.pos[0] + ux * off, contact.pos[1] + uy * off
 
 
+def _at(path, z):
+    """A detour path with every point after the first at altitude z (R2: z >= z_min)."""
+    return [path[0]] + [(q[0], q[1], z) for q in path[1:]]
+
+
 def build_scout_route(scout, tasks, depart, z, scenario, speed):
-    """The kit's _scout_route with an explicit cruise speed (same waypoints at the kit speed)."""
+    """The kit's _scout_route with an explicit cruise speed and diagonal climb/descent.
+
+    R2 bounds a leg's duration by max(horizontal / v_h, vertical / v_up or v_down), and
+    altitude limits apply at waypoints only, so the scout climbs on its way to the first
+    observation and descends on its way home instead of hovering straight up and down.
+    """
     rules_ = scenario.rules
     detour, length, wp = baseline._detour, baseline._length, baseline._wp
     home = scout.home
-    above = (home[0], home[1], z)
+    ground = (home[0], home[1], 0.0)
+    v_up, v_down = SPEED_FACTOR * scout.v_up_mps, SPEED_FACTOR * scout.v_down_mps
     t = depart
     wps = [wp(t, home)]
-    t += z / (SPEED_FACTOR * scout.v_up_mps) + 0.5
-    wps.append(wp(t, above))
-    cur = above
+    cur = ground
     for task in tasks:
         px, py = task["point"]
         cpos = task.get("cpos")
@@ -108,9 +174,15 @@ def build_scout_route(scout, tasks, depart, z, scenario, speed):
         path = detour([cur, target], scenario)
         if path is None:
             return None
+        path = _at(path, z)
         total = length(path)
+        if total < 1.0:
+            return None
         lo, hi = task["window"]
-        arrive = max(t + total / speed, lo)
+        # Climbing legs (only the first) also need z / v_up, spread over the whole path.
+        climb = (z - cur[2]) / v_up + 0.2 if cur[2] < z - EPS else 0.0
+        # 0.01 s absorbs waypoint rounding (1 mm, 1 ms) at near-v_h cruise speed.
+        arrive = max(t + max(total / speed, climb) + 0.01, lo)
         if arrive + rules_.obs_dwell_s > hi:
             return None
         for k in range(1, len(path) - 1):
@@ -119,19 +191,96 @@ def build_scout_route(scout, tasks, depart, z, scenario, speed):
                       dwell_s=rules_.obs_dwell_s))
         t = arrive + rules_.obs_dwell_s
         cur = target
-    path = detour([cur, above], scenario)
+    path = detour([cur, ground], scenario)
     if path is None:
         return None
+    path = _at(path[:-1], z) + [ground]
     total = length(path)
-    arrive = t + total / speed
+    # The descent is spread over the whole way home; the last leg alone must also fit it.
+    last = hdist(path[-2], path[-1])
+    t_last = max(last / speed, z / v_down + 0.2)
+    arrive = t + (total - last) / speed + t_last
+    # Detour points come before the last leg, at the cruise speed.
     for k in range(1, len(path) - 1):
-        wps.append(wp(t + (arrive - t) * length(path[:k + 1]) / total, path[k]))
-    wps.append(wp(arrive, above))
-    wps.append(wp(arrive + z / (SPEED_FACTOR * scout.v_down_mps) + 0.5, home))
+        wps.append(wp(t + length(path[:k + 1]) / speed, path[k]))
+    wps.append(wp(arrive, home))
     for w in wps:
         if "target_id" in w:
             w["target"] = w.pop("target_id")
     return wps
+
+
+def scout_range_m(scout, scenario):
+    """Farthest horizontal distance a scout can fly out to and back from, with one
+    observation dwell, within both its battery and the horizon, at its cruise speed."""
+    rules_ = scenario.rules
+    speed = fast_speed(scout) if SCOUT_SPEED_MODE != "eco" else eco_speed(scout)
+    p = scout.power
+    cruise_w = p.p0_w + p.k_v * speed * speed
+    fixed_wh = (p.p0_w * rules_.obs_dwell_s / 3600.0
+                + p.e_climb_wh_per_m * min(SCOUT_ALTITUDES))
+    by_battery = max(0.0, scout.usable_wh - fixed_wh) * 3600.0 / cruise_w * speed / 2.0
+    by_horizon = max(0.0, scenario.horizon_s - rules_.obs_dwell_s) * speed / 2.0
+    return min(by_battery, by_horizon)
+
+
+def scout_can_serve(scout, contact, scenario, reach):
+    """Lower-bound test: can this scout alone observe the contact (in time for a strike,
+    for hostiles) and get home? reach: its range from scout_range_m."""
+    rules_ = scenario.rules
+    speed = fast_speed(scout) if SCOUT_SPEED_MODE != "eco" else eco_speed(scout)
+    off = obs_offset(scenario, contact, min(SCOUT_ALTITUDES))
+    d = max(0.0, hdist(scout.home, contact.pos) - off)
+    if d > reach:
+        return False
+    lo, hi = contact.window
+    done = max(d / speed, lo) + rules_.obs_dwell_s
+    limit = hi - (rules_.confirm_margin_s if contact.cls == HOSTILE else 0.0)
+    return done <= limit + EPS
+
+
+def low_effector_route(eff, contact, arrive, scenario, cross_z=None):
+    """(route, earliest arrival): pad straight to the engagement point at best-range speed.
+
+    No climb to a cruise layer: R2 limits altitude at waypoints only, and the engagement
+    (the last waypoint) may be low. Zones and protected areas are avoided with the kit's
+    detour points, flown at LOW_DETOUR_Z. cross_z: instead climb diagonally to this
+    altitude on the way out (one waypoint, LOW_CROSS_M short of the target) and dive to
+    the engagement, passing above low scouts at a fraction of the layered routes' climb.
+    """
+    wp = baseline._wp
+    home = (eff.home[0], eff.home[1], 0.0)
+    e_pt = (contact.pos[0], contact.pos[1], LOW_ENGAGE_Z)
+    path = baseline._detour([home, e_pt], scenario)
+    if path is None:
+        return None, arrive
+    z_detour = max(LOW_DETOUR_Z, scenario.rules.z_min_m + 1.0)
+    if cross_z is None:
+        path = [path[0]] + [(q[0], q[1], z_detour) for q in path[1:-1]] + [e_pt]
+    else:
+        path = [path[0]] + [(q[0], q[1], cross_z) for q in path[1:-1]] + [e_pt]
+        last, prev = path[-1], path[-2]
+        d = hdist(prev, last)
+        if d < 2 * LOW_CROSS_M:
+            return None, arrive
+        f = (d - LOW_CROSS_M) / d
+        path.insert(-1, (prev[0] + (last[0] - prev[0]) * f, prev[1] + (last[1] - prev[1]) * f, cross_z))
+    speed = min(SCOUT_CRUISE * eff.v_h_mps, best_range_speed(eff.power))
+    v_up, v_down = SPEED_FACTOR * eff.v_up_mps, SPEED_FACTOR * eff.v_down_mps
+    legs = []
+    for a, b in zip(path, path[1:]):
+        dz = b[2] - a[2]
+        legs.append(max(hdist(a, b) / speed, dz / v_up if dz > 0 else -dz / v_down) + 0.05)
+    earliest = sum(legs)
+    if arrive < earliest:
+        return None, earliest
+    t = arrive - earliest
+    wps = [wp(t, home)]
+    for q, leg in zip(path[1:-1], legs):
+        t += leg
+        wps.append(wp(t, q))
+    wps.append(wp(arrive, e_pt, action="engage", target=contact.id))
+    return wps, earliest
 
 
 def raw_energy_wh(route, scout):
@@ -184,7 +333,7 @@ def scout_tour(scenario, scout, tasks, z, shift=0.0, depart=None):
     hit = _tours.get(key)
     if hit is None or hit[0] is not scenario:
         if len(_tours) > 100000:
-            _tours.clear()
+            evict(_tours)
         hit = _tours[key] = (scenario, _build_tour(scenario, scout, tasks, z, shift, depart))
     return None if hit[1] is None else list(hit[1])
 
@@ -199,8 +348,8 @@ def scout_reachable(scenario, scout, tasks, pos, z, prev_route=None):
     """
     rules_ = scenario.rules
     speed = eco_speed(scout) if SCOUT_SPEED_MODE == "eco" else fast_speed(scout)
-    climb = z / (SPEED_FACTOR * scout.v_up_mps) + 0.5
-    descend = z / (SPEED_FACTOR * scout.v_down_mps) + 0.5
+    # Tours climb and descend diagonally, so straight-line flight is the only lower bound.
+    climb = descend = 0.0
     task = tasks[pos]
     lo, hi = task["window"]
     # Stretched observation points may be pulled in by up to ~35 m at 110 m altitude.
@@ -274,7 +423,7 @@ def _cached_detour(points, scenario):
     key = (id(scenario), tuple(points))
     if key not in _detours:
         if len(_detours) > 200000:
-            _detours.clear()
+            evict(_detours)
         path = _official_detour(points, scenario)
         _detours[key] = (scenario, None if path is None else tuple(path))
     path = _detours[key][1]
@@ -297,6 +446,8 @@ class State:
     score: float
     node_id: int = 0
     keys: dict = field(default_factory=dict)
+    # Contacts whose R4/R10 status must be rechecked: their routes were removed (without()).
+    recheck: frozenset = frozenset()
 
     def plan(self, seed):
         return {"seed": seed, "routes": [
@@ -312,13 +463,80 @@ def route_key(route):
                   w.get("target")) for w in route)
 
 
+# Rules that look at one route only, in the order the validator reports them.
+LOCAL_CHECKS = (rules._r1, rules._r2, rules._r3, rules._r5, rules._r6, rules._r7, rules._r9)
+
+
+# Pairs closer than d_sep + this margin go to the official check (rounding safety).
+SEPARATION_MARGIN_M = 0.01
+
+
+def piece_boxes(item):
+    """Official separation item plus, per flight piece, its bounding box and velocity."""
+    if item is None:
+        return None
+    extra = []
+    for t0, t1, p0, p1 in item[1]:
+        span = t1 - t0
+        k = 1.0 / span if span > 1e-12 else 0.0
+        extra.append((min(p0[0], p1[0]), max(p0[0], p1[0]), min(p0[1], p1[1]), max(p0[1], p1[1]),
+                      min(p0[2], p1[2]), max(p0[2], p1[2]),
+                      (p1[0] - p0[0]) * k, (p1[1] - p0[1]) * k, (p1[2] - p0[2]) * k))
+    return item, extra
+
+
+def may_be_close(a, b, d):
+    """False only if no two time-overlapping pieces of a and b come within d of each other.
+
+    Pieces are straight, constant-speed motions (as in the official geometry): a bounding
+    box gap of at least d, or a closest approach over the shared time of at least d,
+    proves the official close_intervals() finds nothing for that pair of pieces.
+    """
+    (_, pa, s_a, e_a, _), ba = a
+    (_, pb, s_b, e_b, _), bb = b
+    if min(e_a, e_b) - max(s_a, s_b) <= 1e-12:
+        return False
+    dd = d * d
+    i = j = 0
+    na, nb = len(pa), len(pb)
+    while i < na and j < nb:
+        x, y = pa[i], pb[j]
+        lo, hi = max(x[0], y[0]), min(x[1], y[1])
+        if hi - lo > 1e-12:
+            p, q = ba[i], bb[j]
+            if (p[0] - q[1] < d and q[0] - p[1] < d and p[2] - q[3] < d and q[2] - p[3] < d
+                    and p[4] - q[5] < d and q[4] - p[5] < d):
+                # Relative position at lo and relative velocity; minimise |r + w s| on [0, hi-lo].
+                ta, tb = lo - x[0], lo - y[0]
+                xa, xb = x[2], y[2]
+                rx = xb[0] + q[6] * tb - xa[0] - p[6] * ta
+                ry = xb[1] + q[7] * tb - xa[1] - p[7] * ta
+                rz = xb[2] + q[8] * tb - xa[2] - p[8] * ta
+                wx, wy, wz = q[6] - p[6], q[7] - p[7], q[8] - p[8]
+                ww = wx * wx + wy * wy + wz * wz
+                s = 0.0
+                if ww > 1e-18:
+                    s = min(max(-(rx * wx + ry * wy + rz * wz) / ww, 0.0), hi - lo)
+                cx, cy, cz = rx + wx * s, ry + wy * s, rz + wz * s
+                if cx * cx + cy * cy + cz * cz < dd:
+                    return True
+        if x[1] < y[1]:
+            i += 1
+        else:
+            j += 1
+    return False
+
+
 class IncrementalValidator:
     """Reuse valid unchanged routes, including their cached R8 flight pieces.
 
-    Local rules run on replaced/new routes. R4 and R10 run on the entire plan:
-    rebuilding a scout tour can invalidate an earlier engagement's confirmation.
-    R8 checks every pair containing a changed route. Unchanged pairs were already
-    validated in the parent. Scoring uses the same energy and observation helpers.
+    Local rules (one route at a time) run once per distinct route and are cached.
+    R4 and R10 run on every route that touches a contact whose observations or
+    engagements changed: rebuilding a scout tour can invalidate an earlier engagement's
+    confirmation, and the parent was valid for every other contact.
+    R8 checks every pair containing a changed route; pairs whose pieces are provably
+    40 m apart skip the official check. Unchanged pairs were already validated in the
+    parent. Scoring uses the same energy and observation helpers.
     """
     def __init__(self, scenario, stop):
         self.sc = scenario
@@ -329,6 +547,44 @@ class IncrementalValidator:
         self.seconds = 0.0
         self.rejections = {}
         self.last_rule = None
+        self.local = {}
+        self.targets = {}
+        self.d_sep = scenario.rules.d_sep_m + SEPARATION_MARGIN_M
+
+    def local_check(self, aid, route):
+        """(parsed route, (index, rule) of the first local violation or None, separation
+        item with boxes, energy), cached per distinct route."""
+        key = (aid, route_key(route))
+        hit = self.local.get(key)
+        if hit is None:
+            if len(self.local) > 200000:
+                evict(self.local)
+            plan = {"seed": self.sc.seed, "routes": [{"aircraft": aid, "waypoints": route}]}
+            parsed, errors = parse_plan(plan)
+            if errors or parsed is None:
+                raise ValueError("route builder produced malformed waypoints: " + str(errors))
+            failed = None
+            for i, check in enumerate(LOCAL_CHECKS):
+                violations = check(self.sc, parsed, plan) if check is rules._r1 else check(self.sc, parsed)
+                if violations:
+                    failed = (i, violations[0].rule)
+                    break
+            r = parsed[aid]
+            item = energy = None
+            if failed is None:
+                item = piece_boxes(rules.separation_item(aid, r, self.aircraft[aid]))
+                energy = route_energy_wh(r.waypoints, self.aircraft[aid])
+            hit = self.local[key] = (r, failed, item, energy)
+        return hit
+
+    def route_targets(self, route):
+        hit = self.targets.get(id(route))
+        if hit is None or hit[0] is not route:
+            if len(self.targets) > 400000:
+                evict(self.targets)
+            hit = self.targets[id(route)] = (route, frozenset(
+                w.target for w in route.waypoints if w.action is not None))
+        return hit[1]
 
     def check_time(self, stop=None):
         if time.monotonic() >= min(self.stop, stop if stop is not None else self.stop):
@@ -340,13 +596,17 @@ class IncrementalValidator:
         self.rejections[key] = self.rejections.get(key, 0) + 1
         return None
 
-    @staticmethod
-    def without(parent, removed):
-        """Parent minus whole routes; extend() must still recheck R4/R10 globally."""
+    def without(self, parent, removed):
+        """Parent minus whole routes; extend() rechecks R4/R10 for the contacts they touched."""
         def keep(d):
             return {k: v for k, v in d.items() if k not in removed}
+        touched = set(parent.recheck)
+        for aid in removed:
+            if aid in parent.parsed:
+                touched |= self.route_targets(parent.parsed[aid])
         return replace(parent, routes=keep(parent.routes), parsed=keep(parent.parsed),
-                       separation=keep(parent.separation), energies=keep(parent.energies))
+                       separation=keep(parent.separation), energies=keep(parent.energies),
+                       recheck=frozenset(touched))
 
     def extend(self, parent, extra):
         self.check_time()
@@ -379,35 +639,43 @@ class IncrementalValidator:
             self.last_rule = rule
             self.rejections[rule] = self.rejections.get(rule, 0) + 1
             return None
-        plan = {"seed": self.sc.seed, "routes": [
-            {"aircraft": aid, "waypoints": route} for aid, route in extra.items()]}
-        changed, errors = parse_plan(plan)
-        if errors or changed is None:
-            raise ValueError("route builder produced malformed waypoints: " + str(errors))
-        for check in (rules._r1, rules._r2, rules._r3, rules._r5, rules._r6,
-                      rules._r7, rules._r9):
-            violations = check(self.sc, changed, plan) if check is rules._r1 else check(self.sc, changed)
-            if violations:
-                return self.reject(violations)
+        checked = {aid: self.local_check(aid, route) for aid, route in extra.items()}
+        failed = [hit[1] for hit in checked.values() if hit[1] is not None]
+        if failed:
+            # The first rule (in validator order) that any changed route breaks.
+            rule = min(failed)[1]
+            self.last_rule = rule
+            self.rejections[rule] = self.rejections.get(rule, 0) + 1
+            return None
+        changed = {aid: hit[0] for aid, hit in checked.items()}
         parsed = {**parent.parsed, **changed}
-        for check in (rules._r4, rules._r10):
-            violations = check(self.sc, parsed)
-            if violations:
-                return self.reject(violations)
-        new_items = {aid: rules.separation_item(aid, route, self.aircraft[aid])
-                     for aid, route in changed.items()}
+        affected = set(parent.recheck)
+        for aid, route in changed.items():
+            affected |= self.route_targets(route)
+            if aid in parent.parsed:
+                affected |= self.route_targets(parent.parsed[aid])
+        if affected:
+            # Every route touching an affected contact: its R4/R10 verdict is exact.
+            touching = {aid: route for aid, route in parsed.items()
+                        if not affected.isdisjoint(self.route_targets(route))}
+            for check in (rules._r4, rules._r10):
+                violations = check(self.sc, touching)
+                if violations:
+                    return self.reject(violations)
+        new_items = {aid: hit[2] for aid, hit in checked.items()}
         old_items = {aid: item for aid, item in parent.separation.items() if aid not in changed}
         pairs = itertools.chain(itertools.combinations(new_items.values(), 2),
                                 itertools.product(new_items.values(), old_items.values()))
-        for a, b in pairs:
-            self.check_time()
-            if a is not None and b is not None:
-                violation = rules.separation_violation(self.sc.rules, self.contacts, a, b)
+        d_sep = self.d_sep
+        for n, (a, b) in enumerate(pairs):
+            if n % 64 == 0:
+                self.check_time()
+            if a is not None and b is not None and may_be_close(a, b, d_sep):
+                violation = rules.separation_violation(self.sc.rules, self.contacts, a[0], b[0])
                 if violation:
                     return self.reject([violation])
         energies = dict(parent.energies)
-        energies.update({aid: route_energy_wh(route.waypoints, self.aircraft[aid])
-                         for aid, route in changed.items()})
+        energies.update({aid: hit[3] for aid, hit in checked.items()})
         served = set()
         used = set()
         for aid, route in parsed.items():
@@ -447,7 +715,7 @@ class WarmPlanner(_Planner):
 class Search:
     def __init__(self, scenario, seconds=55.0, top_n=5, beam_width=6, start=None, lns_share=0.4,
                  interleave=False, adaptive=False, restarts=True, widen=False,
-                 scout_speed="fast", obs_stretch=True):
+                 scout_speed="fast", obs_stretch=True, variant=0):
         if seconds < 0 or not 1 <= top_n <= 100 or not 1 <= beam_width <= 100:
             raise ValueError("seconds must be nonnegative; top_n and beam_width must be 1..100")
         if not 0 <= lns_share <= 1:
@@ -461,7 +729,9 @@ class Search:
         self.sc = scenario
         self.start = time.monotonic() if start is None else start
         # Includes input reading when the CLI passes its process start time.
-        self.stop = self.start + min(seconds, 55.0)
+        self.stop = self.start + min(seconds, MAX_SEARCH_S)
+        # Variant 0 is the default search; others change random seeds and pass order.
+        self.variant = variant
         self.top_n, self.width = top_n, beam_width
         # The beam ends early so the final share of the budget repairs its best plan.
         self.beam_stop = self.stop - lns_share * max(0.0, self.stop - self.start)
@@ -476,7 +746,7 @@ class Search:
         if interleave:
             # Beam passes alternate with LNS bursts; a short final tail is LNS only.
             self.beam_stop = self.stop - min(lns_share, 0.1) * max(0.0, self.stop - self.start)
-        self.lns_rng = random.Random(scenario.seed + 7919)
+        self.lns_rng = random.Random(scenario.seed + 7919 + VARIANT_SEED_STRIDE * variant)
         self.lns_state = None
         self.weights = {op: 1.0 for op in DESTROY_OPERATORS}
         self.root = State({}, {a.id: [] for a in scenario.aircraft if a.type == SCOUT},
@@ -486,6 +756,12 @@ class Search:
         self.archive = [self.root]
         self.signatures = {self.root.signature()}
         self.matrix = None
+        self.searchable = []
+        # Scout ranges and, per contact, the scouts able to serve it (set_capabilities).
+        self.scout_range, self.capable = {}, {}
+        self.joint_stats = {}
+        self._strike_earliest = {}
+        self.tour_pool = []
         self.passes = 0
         # Per-contact attempt accounting for "why was this contact not served".
         self.attempts = {}
@@ -523,11 +799,12 @@ class Search:
                 state = replace(p.last, tasks=dict(p.tasks))
                 p.state = self.record(state, p.state, {"kind": "greedy", "contact": c.id}, depth)
 
-    def children(self, parent, contact, stop, limit=2, insert=False):
+    def children(self, parent, contact, stop, limit=2, insert=False, only=None):
         """Bounded candidate generation, recording how far each attempt got.
 
         insert=False appends the visit to a scout tour (beam search); insert=True
-        also tries the cheapest earlier tour positions (LNS repair).
+        also tries the cheapest earlier tour positions (LNS repair). only: a single
+        scout to use (idle-scout tours and scout-first construction).
         """
         if contact.id in parent.served:
             return
@@ -536,7 +813,7 @@ class Search:
         progress = {"stage": -1, "outcome": "no_options"}
         outcome = None
         try:
-            yield from self._children(parent, contact, stop, limit, stats, progress, insert)
+            yield from self._children(parent, contact, stop, limit, stats, progress, insert, only)
             outcome = progress["outcome"]
         except DeadlineReached:
             outcome = "accepted" if progress["outcome"] == "accepted" else "time_cap"
@@ -554,13 +831,18 @@ class Search:
         if stage >= progress["stage"]:
             progress["stage"], progress["outcome"] = stage, outcome
 
-    def ranked_scouts(self, parent, contact, insert):
+    def ranked_scouts(self, parent, contact, insert, only=None):
         """Scouts by distance from their tour (insert) or tour end (append) to the contact.
 
         If the first SCOUT_FANOUT are all busy, the nearest idle scout takes the last slot:
         all scouts may share a base, so an idle one is often the only one that fits.
+        Scouts whose tour already visits the contact are left out: a second visit only
+        costs time and energy (existing_observations() reuses the first one).
         """
-        scouts = _Planner(self.sc)._scout_candidates(contact, limit=len(parent.tasks))
+        if only is not None:
+            return [only]
+        scouts = [a for a in _Planner(self.sc)._scout_candidates(contact, limit=len(parent.tasks))
+                  if all(t["cid"] != contact.id for t in parent.tasks[a.id])]
         if insert:
             def reach(a):
                 points = [a.home] + [t["point"] for t in parent.tasks[a.id]]
@@ -569,6 +851,11 @@ class Search:
         else:
             scouts.sort(key=lambda a: hdist(parent.tasks[a.id][-1]["point"] if parent.tasks[a.id]
                                            else a.home, contact.pos))
+        if self.capable:
+            # Keep where idle scouts sit in the ranking, but choose which idle scout by fit.
+            slots = [i for i, a in enumerate(scouts) if not parent.tasks[a.id]]
+            for i, a in zip(slots, self.fit_order([scouts[i] for i in slots], contact)):
+                scouts[i] = a
         head = scouts[:SCOUT_FANOUT]
         if head and all(parent.tasks[a.id] for a in head):
             idle = next((a for a in scouts[SCOUT_FANOUT:] if not parent.tasks[a.id]), None)
@@ -606,21 +893,30 @@ class Search:
             add(tuple(sorted(windows, key=lambda c: (windows[c][0], windows[c][1], c))), False)
         return orders
 
+    def existing_observations(self, parent, contact):
+        """(scout, tasks, route) for scouts whose current route already observes the contact."""
+        for sid, tasks in parent.tasks.items():
+            route = parent.routes.get(sid)
+            if route is not None and any(t["cid"] == contact.id for t in tasks):
+                yield self.aircraft[sid], tasks, route
+
     def scout_options(self, parent, contact, insert, ranks=slice(0, SCOUT_FANOUT),
-                      skip_append=False):
+                      skip_append=False, only=None):
         """(scout, tasks, route or None) for each scout, visit order and flight setting.
 
         Orders that cannot reach the new visit in its window, or get home before the
         horizon, yield None without building a route.
         """
         p = _Planner(self.sc)
-        for scout in self.ranked_scouts(parent, contact, insert)[ranks]:
+        for scout in self.ranked_scouts(parent, contact, insert, only)[ranks]:
             current = parent.tasks[scout.id]
+            if any(t["cid"] == contact.id for t in current):
+                continue
             by_id = {t["cid"]: t for t in current}
             prev_route = parent.routes.get(scout.id)
             for order, keeps_prefix in self.tour_orders(scout, current, contact, insert, skip_append):
                 pos = order.index(contact.id)
-                for z, obs_angle, shift in itertools.product(SCOUT_LAYERS, (0.0, 60.0, -60.0),
+                for z, obs_angle, shift in itertools.product(SCOUT_ALTITUDES, (0.0, 60.0, -60.0),
                                                              (0.0, 7.0)):
                     task = {"cid": contact.id,
                             "point": obs_point(self.sc, scout, contact, obs_angle, z),
@@ -632,10 +928,11 @@ class Search:
                         continue
                     yield scout, tasks, scout_tour(self.sc, scout, tasks, z, shift)
 
-    def _children(self, parent, contact, stop, limit, stats, progress, insert=False):
+    def _children(self, parent, contact, stop, limit, stats, progress, insert=False, only=None):
         """Bounded candidate generation: alternate scouts, teams and flight settings.
 
-        Rounds stop at the first one that yields a child: the nearest scouts as asked
+        Rounds stop at the first one that yields a child: a strike confirmed by an
+        observation already in the plan (hostiles), the nearest scouts as asked
         (append or insert), then (append mode) the same scouts with insertion and
         reordering, then the next SCOUT_FALLBACK - SCOUT_FANOUT scouts with insertion.
         """
@@ -643,10 +940,14 @@ class Search:
         if not groups:
             self._progress(stats, progress, "no_team")
             return
-        rounds = [self.scout_options(parent, contact, insert)]
-        if not insert:
-            rounds.append(self.scout_options(parent, contact, True, skip_append=True))
-        rounds.append(self.scout_options(parent, contact, True, slice(SCOUT_FANOUT, SCOUT_FALLBACK)))
+        rounds = []
+        if contact.cls == HOSTILE and only is None:
+            rounds.append(self.existing_observations(parent, contact))
+        rounds.append(self.scout_options(parent, contact, insert, only=only))
+        if only is None:
+            if not insert:
+                rounds.append(self.scout_options(parent, contact, True, skip_append=True))
+            rounds.append(self.scout_options(parent, contact, True, slice(SCOUT_FANOUT, SCOUT_FALLBACK)))
         state = {"count": 0, "seen": set()}
         for options in rounds:
             for item in self._serve(parent, contact, options, groups, stop, limit, stats,
@@ -702,8 +1003,9 @@ class Search:
         for team in groups:
             found = False
             spacing = min(5.0, self.sc.rules.sync_window_s / max(1, len(team)-1))
-            for delay, angle, rotation in itertools.product((0.0, 8.0, 20.0, 45.0, 90.0),
-                                                             (0.0, 35.0, -35.0), range(3)):
+            settings = [None, "cross"] + list(itertools.product((0.0, 35.0, -35.0), range(3)))
+            for delay, setting in itertools.product((0.0, 8.0, 20.0, 45.0, 90.0), settings):
+                angle, rotation = setting if isinstance(setting, tuple) else (0.0, 0)
                 self.checker.check_time(stop)
                 arrive = base + delay
                 if arrive + spacing*(len(team)-1) > contact.window[1] + EPS:
@@ -711,7 +1013,13 @@ class Search:
                 extra = {scout.id: scout_route}
                 for i, eff in enumerate(team):
                     z = EFFECTOR_LAYERS[(i + rotation) % len(EFFECTOR_LAYERS)]
-                    route, earliest = _effector_route(eff, contact, arrive + spacing*i, z, angle, self.sc)
+                    if not isinstance(setting, tuple):
+                        route, earliest = low_effector_route(
+                            eff, contact, arrive + spacing*i, self.sc,
+                            None if setting is None else LOW_CROSS_Z)
+                    else:
+                        route, earliest = _effector_route(eff, contact, arrive + spacing*i, z, angle,
+                                                          self.sc)
                     if route is None:
                         break
                     extra[eff.id] = route
@@ -728,9 +1036,592 @@ class Search:
                 if found:
                     break
 
-    def repair(self, state, depth):
+    def set_capabilities(self):
+        """Each scout's range and, per contact, the scouts able to serve it alone."""
+        scouts = [a for a in self.sc.aircraft if a.type == SCOUT]
+        self.scout_range = {a.id: scout_range_m(a, self.sc) for a in scouts}
+        self.capable = {
+            c.id: frozenset(a.id for a in scouts
+                            if scout_can_serve(a, c, self.sc, self.scout_range[a.id]))
+            for c in self.sc.contacts if c.cls in (HOSTILE, UNKNOWN) and c.window is not None}
+
+    def fit_order(self, scouts, contact):
+        """Idle scouts in best-fit order for a contact: the smallest range that can still
+        serve it first (keeps long-range scouts free for contacts only they reach), then
+        scouts that cannot serve it alone, by range."""
+        if not self.scout_range:
+            return list(scouts)
+        capable = self.capable.get(contact.id, frozenset())
+        return sorted(scouts, key=lambda a: (a.id not in capable, self.scout_range[a.id]
+                                             if a.id in capable else -self.scout_range[a.id], a.id))
+
+    def net_value(self, contact, used):
+        """Estimated points minus the cheapest free team's cost; None without a team."""
+        if contact.cls == UNKNOWN:
+            return contact.points
+        groups = self.matrix.groups(contact, used, 1)
+        if not groups:
+            return None
+        return contact.points - sum(self.matrix.costs[a.id, contact.id] for a in groups[0])
+
+    def grow(self, state, scout, stop, depth, kind, rng=None):
+        """Greedy orienteering for one scout: repeatedly add the contact that raises the
+        plan score most. Candidates are ranked by estimated net value per added kilometre
+        of tour (cheapest insertion); only GROW_CANDIDATES are tried per step. rng adds
+        noise to the ranking (LNS scout rebuilds explore different chains)."""
+        failed = set()
+        while True:
+            self.checker.check_time(stop)
+            points = ([scout.home[:2]] + [t["point"] for t in state.tasks[scout.id]]
+                      + [scout.home[:2]])
+            ranked = []
+            for c in self.searchable:
+                if c.id in state.served or c.id in failed:
+                    continue
+                value = self.net_value(c, state.used)
+                if value is None or value <= 0:
+                    continue
+                added = min(hdist(points[i], c.pos) + hdist(c.pos, points[i + 1])
+                            - hdist(points[i], points[i + 1]) for i in range(len(points) - 1))
+                noise = rng.uniform(0.6, 1.4) if rng is not None else 1.0
+                ranked.append((-noise * value / (1.0 + added / 1000.0), c.id, c))
+            ranked.sort(key=lambda r: r[:2])
+            best = None
+            for _, _, contact in ranked[:GROW_CANDIDATES]:
+                local_stop = min(stop, time.monotonic() + GROW_CONTACT_S)
+                found = False
+                try:
+                    for child, decision in self.children(state, contact, local_stop, 2, True,
+                                                         only=scout):
+                        found = True
+                        if best is None or child.score > best[0].score:
+                            best = (child, decision)
+                except DeadlineReached:
+                    self.checker.check_time(stop)
+                if not found:
+                    failed.add(contact.id)
+            if best is None or best[0].score <= state.score + 1e-9:
+                return state, depth
+            depth += 1
+            state = self.record(best[0], state, {**best[1], "kind": kind}, depth)
+
+    def fill_idle(self, state, depth, stop):
+        """Give every idle scout its own greedy tour over what is still unserved."""
+        idle = [a for a in self.sc.aircraft if a.type == SCOUT and not state.tasks[a.id]
+                and a.id not in state.routes]
+        for scout in sorted(idle, key=lambda a: (-a.usable_wh, a.id)):
+            state, depth = self.grow(state, scout, stop, depth, "idle")
+        return state, depth
+
+    def construct(self, stop):
+        """Scout-first construction ("sector tours"), an alternative to the beam's
+        contact-first order. Valuable anchor contacts spread over different bearings
+        from the scout bases each get their own scout (bigger batteries first); each
+        tour then grows with contacts that are cheap to insert along its way."""
+        scouts = sorted((a for a in self.sc.aircraft if a.type == SCOUT),
+                        key=lambda a: (-a.usable_wh, a.id))
+        if not scouts or not self.searchable:
+            return
+        cx = sum(a.home[0] for a in scouts) / len(scouts)
+        cy = sum(a.home[1] for a in scouts) / len(scouts)
+        valued = [(self.net_value(c, frozenset()), c) for c in self.searchable]
+        valued = sorted(((v, c) for v, c in valued if v is not None and v > 0),
+                        key=lambda vc: (-vc[0], vc[1].id))
+        gap = math.pi / len(scouts)
+        anchors, bearings = [], []
+        for _, c in valued:
+            bearing = math.atan2(c.pos[1] - cy, c.pos[0] - cx)
+            if all(abs((bearing - b + math.pi) % (2 * math.pi) - math.pi) >= gap for b in bearings):
+                anchors.append(c)
+                bearings.append(bearing)
+                if len(anchors) == len(scouts):
+                    break
+        state, depth = self.root, 0
+        anchors.sort(key=lambda c: (-hdist((cx, cy), c.pos), c.id))
+        free = list(scouts)
+        for anchor in anchors:
+            self.checker.check_time(stop)
+            best = None
+            for scout in self.fit_order(free, anchor)[:2]:
+                local_stop = min(stop, time.monotonic() + GROW_CONTACT_S)
+                try:
+                    for child, decision in self.children(state, anchor, local_stop, 2, True,
+                                                         only=scout):
+                        if best is None or child.score > best[0].score:
+                            best = (child, decision, scout)
+                except DeadlineReached:
+                    self.checker.check_time(stop)
+            if best is not None:
+                depth += 1
+                state = self.record(best[0], state, {**best[1], "kind": "anchor"}, depth)
+                free.remove(best[2])
+        for scout in scouts:
+            state, depth = self.grow(state, scout, stop, depth, "sector")
+
+    def deep_repair(self, state, depth, stop, per_try=0.3):
+        """Insert each unserved contact with a positive estimated net value at its best
+        place over every scout and every tour position (the beam and LNS only try the
+        nearest scouts and the cheapest positions). Repeats until nothing improves."""
+        global FULL_INSERT_TASKS
+        saved, FULL_INSERT_TASKS = FULL_INSERT_TASKS, 1000
+        scouts = [a for a in self.sc.aircraft if a.type == SCOUT]
+        try:
+            improved = True
+            while improved:
+                improved = False
+                ranked = []
+                for c in self.searchable:
+                    if c.id in state.served:
+                        continue
+                    value = self.net_value(c, state.used)
+                    if value is not None and value > 0:
+                        ranked.append((-value, c.id, c))
+                for _, _, contact in sorted(ranked, key=lambda r: r[:2]):
+                    self.checker.check_time(stop)
+                    best = None
+                    for scout in scouts:
+                        local_stop = min(stop, time.monotonic() + per_try)
+                        try:
+                            for child, decision in self.children(state, contact, local_stop, 2, True,
+                                                                 only=scout):
+                                if best is None or child.score > best[0].score:
+                                    best = (child, decision)
+                        except DeadlineReached:
+                            self.checker.check_time(stop)
+                    if best is not None and best[0].score > state.score + 1e-9:
+                        depth += 1
+                        state = self.record(best[0], state, {**best[1], "kind": "deep"}, depth)
+                        improved = True
+        finally:
+            FULL_INSERT_TASKS = saved
+        return state, depth
+
+    def refly(self, state, depth):
+        """Rebuild existing routes with the cheaper flight profiles, one route at a time:
+        strikes as low direct routes (same target and arrival time), scout tours with
+        diagonal climbs at each altitude. A change is kept only if the plan stays valid,
+        serves at least the same contacts and scores higher."""
+        for aid in sorted(state.routes):
+            self.checker.check_time()
+            route = state.routes[aid]
+            aircraft = self.aircraft[aid]
+            options = []
+            if aircraft.type == SCOUT:
+                tasks = state.tasks.get(aid) or []
+                if not tasks:
+                    continue
+                for z in SCOUT_ALTITUDES:
+                    for depart in (route[0]["t"], None):
+                        tour = scout_tour(self.sc, aircraft, tasks, z, depart=depart)
+                        if tour is not None:
+                            options.append(tour)
+            else:
+                last = route[-1]
+                contact = self.contacts.get(last.get("target"))
+                if last.get("action") != "engage" or contact is None:
+                    continue
+                for shift in REFLY_SHIFTS_S:
+                    for cross in (None, LOW_CROSS_Z):
+                        low, _ = low_effector_route(aircraft, contact, last["t"] + shift, self.sc, cross)
+                        if low is not None:
+                            options.append(low)
+            best = None
+            for new in options:
+                if new == route:
+                    continue
+                candidate = self.checker.extend(state, {aid: new})
+                if (candidate is not None and candidate.served >= state.served
+                        and candidate.score > (best or state).score + 1e-9):
+                    candidate.tasks = state.tasks
+                    best = candidate
+            if best is not None:
+                depth += 1
+                state = self.record(best, state, {"kind": "refly", "aircraft": aid}, depth)
+        return state, depth
+
+    def prune(self, state, depth):
+        """Drop scout visits that serve nothing (repeat observations, hostiles never
+        struck) when the rebuilt tour keeps every served contact and saves energy."""
+        improved = True
+        while improved:
+            improved = False
+            counts = {}
+            for tasks in state.tasks.values():
+                for t in tasks:
+                    counts[t["cid"]] = counts.get(t["cid"], 0) + 1
+            for sid, tasks in sorted(state.tasks.items()):
+                route = state.routes.get(sid)
+                if route is None:
+                    continue
+                for i, task in enumerate(tasks):
+                    if task["cid"] in state.served and counts[task["cid"]] == 1:
+                        continue
+                    rest = tasks[:i] + tasks[i + 1:]
+                    options = []
+                    if not rest:
+                        options.append((self.checker.without(state, {sid}), {}))
+                    else:
+                        for depart in (route[0]["t"], None):
+                            tour = scout_tour(self.sc, self.aircraft[sid], rest, route[1]["z"],
+                                              depart=depart)
+                            if tour is not None:
+                                options.append((state, {sid: tour}))
+                    for base, extra in options:
+                        self.checker.check_time()
+                        candidate = self.checker.extend(base, extra)
+                        if (candidate is not None and candidate.served >= state.served
+                                and candidate.score > state.score + 1e-9):
+                            candidate.tasks = {**state.tasks, sid: rest}
+                            depth += 1
+                            state = self.record(candidate, state,
+                                                {"kind": "prune", "contact": task["cid"]}, depth)
+                            improved = True
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+        return state
+
+    # Joint scout planning (column generation): candidate tours per scout, then the best
+    # combination of one tour per scout, then strikes on the chosen observations.
+
+    def strike_earliest(self, contact):
+        """Earliest time the slowest needed effector type can reach the contact."""
+        hit = self._strike_earliest.get(contact.id)
+        if hit is None:
+            hit = 0.0
+            for sub, k in contact.needs.items():
+                if k > 0:
+                    hit = max(hit, min((hdist(a.home, contact.pos)
+                                        / min(SCOUT_CRUISE * a.v_h_mps, best_range_speed(a.power))
+                                        for a in self.sc.aircraft
+                                        if a.type != SCOUT and a.subtype == sub), default=INF))
+            self._strike_earliest[contact.id] = hit
+        return hit
+
+    def tour_ok(self, scout, tasks, route):
+        """Route fits battery and the horizon with JOINT_SLACK_S to spare (so it can be
+        delayed at take-off against R8), and every hostile can still be struck: its
+        effectors reach it, after observation + confirm margin, with the team's spacing,
+        before the window closes."""
+        if route is None or route[-1]["t"] > self.sc.horizon_s - JOINT_SLACK_S:
+            return False
+        if raw_energy_wh(route, scout) > scout.usable_wh + EPS:
+            return False
+        rules_ = self.sc.rules
+        for w in route:
+            if w.get("action") == "observe":
+                c = self.contacts[w["target"]]
+                if c.cls != HOSTILE:
+                    continue
+                team = sum(k for k in c.needs.values() if k > 0)
+                spacing = min(5.0, rules_.sync_window_s / max(1, team - 1)) * (team - 1)
+                first = max(w["t"] + w.get("dwell_s", 0.0) + rules_.confirm_margin_s + 2.0,
+                            self.strike_earliest(c))
+                if first + spacing > c.window[1] - 1.0:
+                    return False
+        return True
+
+    def random_tour(self, scout, values, rng, z, noise):
+        """One candidate tour: randomised nearest-neighbour insertion by value per added
+        kilometre, keeping each insertion that adds value net of the scout's energy."""
+        lam = self.sc.rules.lambda_e
+        pool = [c for c in self.searchable if values.get(c.id, 0.0) > 0
+                and scout.id in self.capable.get(c.id, ())]
+        tasks, route, energy, value = [], None, 0.0, 0.0
+        chosen = set()
+        while True:
+            points = [scout.home[:2]] + [t["point"] for t in tasks] + [scout.home[:2]]
+            ranked = []
+            for c in pool:
+                if c.id in chosen:
+                    continue
+                added = min(hdist(points[i], c.pos) + hdist(c.pos, points[i + 1])
+                            - hdist(points[i], points[i + 1]) for i in range(len(points) - 1))
+                ranked.append((-values[c.id] * rng.uniform(1.0 - noise, 1.0 + noise)
+                               / (1.0 + added / 1000.0), c.id, c))
+            ranked.sort(key=lambda r: r[:2])
+            best = None
+            for _, _, c in ranked[:JOINT_NEIGHBOURS]:
+                task = {"cid": c.id, "point": obs_point(self.sc, scout, c, 0.0, z),
+                        "window": c.window, "cpos": c.pos}
+                for pos in insertion_positions(scout.home, tasks, c.pos, min(3, len(tasks) + 1)):
+                    new = tasks[:pos] + [task] + tasks[pos:]
+                    if not scout_reachable(self.sc, scout, new, pos, z):
+                        continue
+                    r = scout_tour(self.sc, scout, new, z)
+                    if not self.tour_ok(scout, new, r):
+                        continue
+                    e = raw_energy_wh(r, scout)
+                    gain = values[c.id] - lam * (e - energy)
+                    if gain > 0 and (best is None or gain > best[0]):
+                        best = (gain, new, r, e, c.id)
+            if best is None:
+                break
+            _, tasks, route, energy, cid = best
+            chosen.add(cid)
+            value += values[cid]
+        if not tasks:
+            return None
+        return {"scout": scout.id, "cids": frozenset(chosen), "tasks": tasks, "z": z,
+                "value": value - lam * energy}
+
+    def select_tours(self, columns, rng, stop):
+        """At most one tour per scout, no contact twice, within the effector supply:
+        randomised greedy picks plus swap improvement, best total kept."""
+        supply = {}
+        for a in self.sc.aircraft:
+            if a.type != SCOUT:
+                supply[a.subtype] = supply.get(a.subtype, 0) + 1
+        need = {}
+        for col in columns:
+            n = {}
+            for cid in col["cids"]:
+                for sub, k in self.contacts[cid].needs.items():
+                    if self.contacts[cid].cls == HOSTILE:
+                        n[sub] = n.get(sub, 0) + k
+            need[id(col)] = n
+
+        def fits(selection, col, dropping=()):
+            scouts = {c["scout"] for c in selection if c not in dropping}
+            if col["scout"] in scouts:
+                return False
+            used = set()
+            for c in selection:
+                if c not in dropping:
+                    used |= c["cids"]
+            if used & col["cids"]:
+                return False
+            total = dict(need[id(col)])
+            for c in selection:
+                if c not in dropping:
+                    for sub, k in need[id(c)].items():
+                        total[sub] = total.get(sub, 0) + k
+            return all(total.get(sub, 0) <= supply.get(sub, 0) for sub in total)
+
+        best, best_total = [], 0.0
+        for attempt in range(1000):
+            if time.monotonic() >= stop:
+                break
+            noise = 0.0 if attempt == 0 else 0.3
+            order = sorted(columns, key=lambda c: -c["value"] * rng.uniform(1 - noise, 1 + noise))
+            selection = []
+            for col in order:
+                if col["value"] > 0 and fits(selection, col):
+                    selection.append(col)
+            improved = True
+            while improved and time.monotonic() < stop:
+                improved = False
+                for col in columns:
+                    if col in selection or col["value"] <= 0:
+                        continue
+                    conflicts = [c for c in selection if c["scout"] == col["scout"]
+                                 or c["cids"] & col["cids"]]
+                    if (col["value"] > sum(c["value"] for c in conflicts) + 1e-9
+                            and fits(selection, col, conflicts)):
+                        selection = [c for c in selection if c not in conflicts] + [col]
+                        improved = True
+            total = sum(c["value"] for c in selection)
+            if total > best_total:
+                best, best_total = selection, total
+        return best
+
+    def build_joint(self, chosen, stop):
+        """Scout routes of the chosen tours (most valuable first), then the strikes on the
+        hostiles they observe; every step is recorded in the archive."""
+        state, depth = self.root, 0
+        for col in sorted(chosen, key=lambda c: -c["value"]):
+            new = self.place_tour(state, col, stop)
+            if new is not None:
+                depth += 1
+                state = self.record(new, state, {"kind": "joint", "scout": col["scout"]}, depth)
+        hostiles = [self.contacts[cid] for col in chosen for cid in col["cids"]
+                    if self.contacts[cid].cls == HOSTILE]
+        hostiles.sort(key=lambda c: (-self.matrix.priority(c), c.id))
+        for contact in hostiles:
+            if time.monotonic() >= stop:
+                break
+            self.checker.check_time()
+            sid = next((s for s, ts in state.tasks.items()
+                        if any(t["cid"] == contact.id for t in ts) and s in state.routes), None)
+            if sid is None:
+                continue
+            route = state.routes[sid]
+            obs_end = max((w["t"] + w.get("dwell_s", 0.0) for w in route
+                           if w.get("target") == contact.id and w.get("action") == "observe"),
+                          default=None)
+            groups = self.matrix.groups(contact, state.used)
+            if obs_end is None or not groups:
+                continue
+            local_stop = min(stop, time.monotonic() + 0.4)
+            try:
+                for candidate, team in self.strikes(state, contact, groups, self.aircraft[sid],
+                                                    route, obs_end, local_stop):
+                    if candidate.score > state.score:
+                        candidate.tasks = state.tasks
+                        depth += 1
+                        state = self.record(candidate, state, {"kind": "joint-strike",
+                                                               "contact": contact.id}, depth)
+                        break
+            except DeadlineReached:
+                self.checker.check_time()
+        return state
+
+    def place_tour(self, state, col, stop):
+        """State with the tour flown by its scout, or None if no altitude layer and
+        take-off delay passes the validator (R8 against the routes already placed)."""
+        scout = self.aircraft[col["scout"]]
+        for z, shift in itertools.product(JOINT_BUILD_ALTITUDES, JOINT_BUILD_SHIFTS):
+            self.checker.check_time(stop)
+            route = scout_tour(self.sc, scout, col["tasks"], z, shift)
+            if route is None:
+                continue
+            new = self.checker.extend(state, {scout.id: route})
+            if new is not None:
+                new.tasks = {**state.tasks, scout.id: col["tasks"]}
+                return new
+        return None
+
+    def trim_tour(self, col, values):
+        """The tour without its lowest-value contact, or None."""
+        if len(col["tasks"]) < 2:
+            return None
+        scout = self.aircraft[col["scout"]]
+        drop = min(col["cids"], key=lambda cid: (values.get(cid, 0.0), cid))
+        tasks = [t for t in col["tasks"] if t["cid"] != drop]
+        route = scout_tour(self.sc, scout, tasks, col["z"])
+        if not self.tour_ok(scout, tasks, route):
+            return None
+        energy = raw_energy_wh(route, scout)
+        cids = col["cids"] - {drop}
+        return {"scout": scout.id, "cids": cids, "tasks": tasks, "z": col["z"],
+                "value": sum(values.get(c, 0.0) for c in cids)
+                - self.sc.rules.lambda_e * energy}
+
+    def joint(self, stop):
+        """Plan all scout tours jointly, then strike what they confirm (see above)."""
+        scouts = [a for a in self.sc.aircraft if a.type == SCOUT]
+        if not scouts or not self.searchable:
+            return
+        rng = random.Random(self.sc.seed + 31 + VARIANT_SEED_STRIDE * self.variant)
+        values = {}
+        for c in self.searchable:
+            v = self.net_value(c, frozenset())
+            if v is not None and v > 0:
+                values[c.id] = v
+        start = time.monotonic()
+        gen_stop = start + 0.6 * max(0.0, stop - start)
+        supply = {}
+        for a in self.sc.aircraft:
+            if a.type != SCOUT:
+                supply[a.subtype] = supply.get(a.subtype, 0) + 1
+        # Restarts: scouts in a random order (longest range first in the first one), each
+        # touring only contacts nobody took yet, within the effector supply left. Every
+        # tour joins a pool; the best complete solution and the pool feed the selection.
+        columns, seen, restarts, since_better = [], set(), 0, 0
+        top = []  # (estimate, signature, tours) of the best distinct restart solutions
+        best_solution, best_total = [], 0.0
+        while time.monotonic() < gen_stop:
+            self.checker.check_time(stop)
+            order = list(scouts)
+            if restarts == 0:
+                order.sort(key=lambda a: (-self.scout_range.get(a.id, 0.0), a.id))
+            else:
+                rng.shuffle(order)
+            left = dict(supply)
+            free = dict(values)
+            solution = []
+            for scout in order:
+                if time.monotonic() >= gen_stop:
+                    break
+                for cid in list(free):
+                    c = self.contacts[cid]
+                    if c.cls == HOSTILE and any(left.get(sub, 0) < k for sub, k in c.needs.items()):
+                        del free[cid]
+                col = self.random_tour(scout, free, rng, SCOUT_ALTITUDES[0],
+                                       0.0 if restarts == 0 else JOINT_NOISE)
+                if col is None:
+                    continue
+                solution.append(col)
+                for cid in col["cids"]:
+                    free.pop(cid, None)
+                    c = self.contacts[cid]
+                    if c.cls == HOSTILE:
+                        for sub, k in c.needs.items():
+                            left[sub] = left.get(sub, 0) - k
+                key = (col["scout"], tuple(t["cid"] for t in col["tasks"]))
+                if key not in seen:
+                    seen.add(key)
+                    columns.append(col)
+            total = sum(c["value"] for c in solution)
+            key = frozenset((c["scout"], c["cids"]) for c in solution)
+            if solution and key not in {k for _, k, _ in top}:
+                top.append((total, key, solution))
+                top.sort(key=lambda t: -t[0])
+                del top[JOINT_BUILDS:]
+            if total > best_total + 1e-9:
+                best_solution, best_total = solution, total
+                since_better = 0
+            else:
+                since_better += 1
+            restarts += 1
+            if since_better >= JOINT_PATIENCE:
+                # Converged: hand the rest of the time (selection, build, beam) back.
+                stop = min(stop, time.monotonic() + 0.4 * max(0.0, stop - start))
+                break
+        # Kept for the opt-in column-swap LNS (column_lns.py).
+        self.tour_pool = columns
+        self.joint_stats = {"restarts": restarts, "columns": len(columns),
+                            "best_restart": round(best_total, 1)}
+        chosen = self.select_tours(columns, rng, start + 0.7 * max(0.0, stop - start))
+        # Estimates miss take-off conflicts and strike timing by 50-150 points per L4, in
+        # varying amounts: build the best few distinct candidates and keep the best result.
+        candidates = [chosen] + [sol for _, _, sol in top]
+        unique, keys = [], set()
+        for cand in sorted(candidates, key=lambda c: -sum(t["value"] for t in c)):
+            key = frozenset((t["scout"], t["cids"]) for t in cand)
+            if cand and key not in keys:
+                keys.add(key)
+                unique.append(cand)
+        unique = unique[:JOINT_BUILDS]
+        self.joint_stats["chosen"] = len(unique[0]) if unique else 0
+        self.joint_stats["estimate"] = round(sum(t["value"] for t in unique[0]), 1) if unique else 0.0
+        state, depth, built = self.root, 0, []
+        # The builds share 70% of what is left; the repair and cleanup get the rest.
+        builds_end = time.monotonic() + 0.7 * max(0.0, stop - time.monotonic())
+        for i, cand in enumerate(unique):
+            # The top candidate is built fully; the others only use time left over.
+            build_stop = builds_end
+            if i > 0 and builds_end - time.monotonic() < 2.0:
+                break
+            try:
+                result = self.build_joint(cand, build_stop)
+            except DeadlineReached:
+                self.checker.check_time(stop)
+                break
+            built.append(round(result.score, 1))
+            if result.score > state.score:
+                state = result
+        depth = len(state.served)
+        self.joint_stats["builds"] = built
+        self.joint_stats["built"] = round(state.score, 1)
+        # Contacts of tours that did not fit (R8) go to whichever scout can take them.
+        try:
+            state = self.repair(state, depth, stop)
+        except DeadlineReached:
+            pass
+        try:
+            state = self.prune(state, depth)
+        except DeadlineReached:
+            pass
+        self.joint_stats["repaired"] = round(state.score, 1)
+
+    def repair(self, state, depth, stop=None):
         """Greedy fill of what the search left unserved: unknowns join any scout tour at
-        their cheapest positions, then hostiles retry with the free effectors."""
+        their cheapest positions, then hostiles retry with the free effectors.
+        stop: optional earlier deadline (returns the state reached so far)."""
+        stop = self.checker.stop if stop is None else min(stop, self.checker.stop)
         improved = True
         while improved:
             improved = False
@@ -740,7 +1631,9 @@ class Search:
             contacts.sort(key=lambda c: (c.cls != UNKNOWN, -self.matrix.priority(c), c.id))
             for contact in contacts:
                 self.checker.check_time()
-                local_stop = min(self.checker.stop, time.monotonic() + 0.25)
+                if time.monotonic() >= stop:
+                    return state
+                local_stop = min(stop, time.monotonic() + 0.25)
                 best = None
                 try:
                     for child, decision in self.children(state, contact, local_stop, 4, True):
@@ -760,11 +1653,12 @@ class Search:
         while contacts:
             self.checker.check_time()
             # Different orders explore different scout tours and allocations.
-            if self.passes % 4 == 0:
+            kind = (self.passes + self.variant) % 4
+            if kind == 0:
                 order = sorted(contacts, key=lambda c: (-priorities[c.id], c.id))
-            elif self.passes % 4 == 1:
+            elif kind == 1:
                 order = sorted(contacts, key=lambda c: (c.window[1], -priorities[c.id], c.id))
-            elif self.passes % 4 == 2:
+            elif kind == 2:
                 order = sorted(contacts, key=lambda c: (-c.points, c.id))
             else:
                 noise = {c.id: rng.uniform(0.65, 1.35) for c in contacts}
@@ -798,7 +1692,7 @@ class Search:
                 burst = (time.monotonic() - pass_start) * self.lns_share / (1 - self.lns_share)
                 self.improve(contacts, priorities, time.monotonic() + burst)
             # Bound trace size for long runs on tiny or impossible scenarios.
-            if len(self.trace) >= 20000:
+            if len(self.trace) >= TRACE_CAP:
                 return False
         return True
 
@@ -815,11 +1709,23 @@ class Search:
         except DeadlineReached:
             pass
         self.matrix = CandidateMatrix(self.sc)
+        self.set_capabilities()
         contacts = [c for c in self.sc.contacts if c.cls in (HOSTILE, UNKNOWN)
                     and c.window is not None and c.id not in self.matrix.banned]
         priorities = {c.id: self.matrix.priority(c) for c in contacts}
-        rng = random.Random(self.sc.seed)
+        self.searchable = contacts
+        rng = random.Random(self.sc.seed + VARIANT_SEED_STRIDE * self.variant)
         self.checker.stop = min(self.beam_stop, self.stop)
+        try:
+            self.joint(time.monotonic()
+                       + JOINT_SHARE * max(0.0, self.checker.stop - time.monotonic()))
+        except DeadlineReached:
+            pass
+        try:
+            self.construct(time.monotonic()
+                           + CONSTRUCT_SHARE * max(0.0, self.checker.stop - time.monotonic()))
+        except DeadlineReached:
+            pass
         try:
             self.search(contacts, priorities, rng)
         except DeadlineReached:
@@ -828,19 +1734,30 @@ class Search:
         return contacts, priorities
 
     def improve_phase(self, contacts, priorities):
-        """Greedy repair of the best beam plan, then LNS until the deadline."""
-        # Greedy repair of the best plan gets at most a quarter of the LNS share.
-        self.checker.stop = self.beam_stop + 0.25 * max(0.0, self.stop - self.beam_stop)
+        """Cleanup, idle-scout tours and greedy repair of the best plan, then LNS until
+        shortly before the deadline, then cleanup of the best plans' tours."""
+        repair_stop = self.beam_stop + REPAIR_SHARE * max(0.0, self.stop - self.beam_stop)
+        self.checker.stop = repair_stop
         try:
             if contacts:
                 best = self.archive[0]
                 depth = max((n["depth"] for n in self.trace if n["id"] == best.node_id), default=0)
-                self.repair(best, depth)
+                state = self.prune(best, depth)
+                state, depth = self.refly(state, depth)
+                state, depth = self.fill_idle(state, depth, repair_stop)
+                self.repair(state, depth)
+        except DeadlineReached:
+            pass
+        reserve = POLISH_RESERVE_S if self.stop - self.start > 5.0 else 0.0
+        self.checker.stop = self.stop - reserve
+        try:
+            self.improve(contacts, priorities, self.stop - reserve)
         except DeadlineReached:
             pass
         self.checker.stop = self.stop
         try:
-            self.improve(contacts, priorities)
+            for state in list(self.archive[:3]):
+                self.refly(self.prune(state, 0), 0)
         except DeadlineReached:
             pass
 
@@ -849,7 +1766,7 @@ class Search:
         # plans because every scout already has its return-and-land leg.
         verified = []
         for state in self.archive:
-            if time.monotonic() >= self.start + 58.0:
+            if time.monotonic() >= self.stop + 3.0:
                 break
             result = evaluate(self.sc, state.plan(self.sc.seed))
             if result.valid:
@@ -858,6 +1775,48 @@ class Search:
             verified = [(self.root, evaluate(self.sc, self.root.plan(self.sc.seed)))]
         verified.sort(key=lambda pair: -pair[1].score)
         return verified
+
+    def rebuild_scout(self, state, scout, rng, stop):
+        """Regrow an emptied scout tour: first an anchor drawn by value per capable scout
+        (contacts few scouts can reach are this scout's natural anchors), then greedy
+        growth with a noisy ranking."""
+        anchors = []
+        for c in self.searchable:
+            capable = self.capable.get(c.id, frozenset())
+            if c.id in state.served or scout.id not in capable:
+                continue
+            value = self.net_value(c, state.used)
+            if value is not None and value > 0:
+                anchors.append((-value / len(capable) * rng.uniform(0.5, 1.5), c.id, c))
+        for _, _, anchor in sorted(anchors)[:4]:
+            best_child = None
+            local_stop = min(stop, time.monotonic() + 0.4)
+            try:
+                for child, _ in self.children(state, anchor, local_stop, 2, True, only=scout):
+                    if best_child is None or child.score > best_child.score:
+                        best_child = child
+            except DeadlineReached:
+                self.checker.check_time(stop)
+            if best_child is not None:
+                state = best_child
+                break
+        state, _ = self.grow(state, scout, stop, 0, "rebuild", rng)
+        return state
+
+    def clear_scout(self, state, sid):
+        """State without scout sid's tour and without the strikes on the hostiles it
+        observes (remove() may keep a hostile's observation when a rebuilt tour fails;
+        a scout rebuild needs the scout really free). None if no valid state results."""
+        observed = {t["cid"] for t in state.tasks.get(sid, [])}
+        removed = {sid} if sid in state.routes else set()
+        for aid, route in state.parsed.items():
+            if any(w.action == "engage" and w.target in observed for w in route.waypoints):
+                removed.add(aid)
+        candidate = self.checker.extend(self.checker.without(state, removed), {})
+        if candidate is None:
+            return None
+        candidate.tasks = {**state.tasks, sid: []}
+        return candidate
 
     def remove(self, state, cid):
         """State without contact cid, or None if no valid removal was found.
@@ -920,7 +1879,7 @@ class Search:
         saved, self.checker.stop = self.checker.stop, stop
         try:
             # Small scenarios converge quickly; stopping early lowers the runtime tie-break.
-            while st["since_best"] < 400:
+            while st["since_best"] < LNS_PATIENCE:
                 self.checker.check_time()
                 self.lns_step(st, contacts, priorities)
         except DeadlineReached:
@@ -957,7 +1916,37 @@ class Search:
             op = "related" if rng.random() < 0.5 else "random"
         removed = []
         partial = current
-        if served:
+        if rng.random() < SCOUT_REBUILD_P:
+            # Scout LNS: clear 1-3 scout tours together (with the strikes they confirm) and
+            # rebuild them jointly, longest range first, each from an anchor that few scouts
+            # can reach. Their old contacts are offered back to every scout below, so a
+            # long-range scout can move to a far cluster while others take its old work.
+            op = "rebuild"
+            scouts = [a for a in self.sc.aircraft if a.type == SCOUT]
+            weights = {a.id: 1.0 + sum(1.0 / len(caps) for cid, caps in self.capable.items()
+                                       if a.id in caps and cid not in current.served
+                                       and cid not in self.matrix.banned)
+                       for a in scouts}
+            group = []
+            for _ in range(rng.choice(SCOUT_REBUILD_SIZES)):
+                pool = [a for a in scouts if a not in group]
+                if not pool:
+                    break
+                group.append(rng.choices(pool, weights=[weights[a.id] for a in pool])[0])
+            for scout in group:
+                cleared = self.clear_scout(partial, scout.id)
+                if cleared is not None:
+                    partial = cleared
+            removed = [cid for cid in current.served if cid not in partial.served and cid in by_id]
+            rebuild_stop = min(self.checker.stop,
+                               time.monotonic() + SCOUT_REBUILD_S * len(group))
+            try:
+                for scout in sorted(group, key=lambda a: (-self.scout_range.get(a.id, 0.0), a.id)):
+                    partial = self.rebuild_scout(partial, scout, rng, rebuild_stop)
+            except DeadlineReached:
+                self.checker.check_time()
+            removed = [cid for cid in removed if cid not in partial.served]
+        elif served:
             for cid in self.destroy(op, served, by_id, current, priorities, rng):
                 smaller = self.remove(partial, cid)
                 if smaller is not None:
@@ -998,7 +1987,7 @@ class Search:
                 self.lns["gain"] += current.score - best.score
                 st["best"], st["stale"], st["since_best"] = current, 0, 0
                 reward = 3.0
-        if self.adaptive:
+        if self.adaptive and op in self.weights:
             self.weights[op] = max(0.05, 0.8 * self.weights[op] + 0.2 * reward)
         if reward == 3.0:
             return

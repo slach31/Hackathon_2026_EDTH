@@ -34,8 +34,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("scenario")
     parser.add_argument("plan")
-    parser.add_argument("--seconds", type=float, default=55.0,
-                        help="search deadline including startup, capped at 55 seconds")
+    # 50 s leaves ~10 s inside the organisers' 60 s limit: L4 runs reached 57-58 s of wall
+    # time at a 55 s deadline under CPU load (OS stalls, process start-up and exit).
+    parser.add_argument("--seconds", type=float, default=50.0,
+                        help="search deadline including startup (default 50, capped at 55 seconds)")
     parser.add_argument("--top-n", type=int, default=5)
     parser.add_argument("--beam-width", type=int, default=6)
     parser.add_argument("--lns-share", type=float, default=0.4,
@@ -53,6 +55,9 @@ def main():
     parser.add_argument("--obs-stretch", action=argparse.BooleanOptionalAction, default=True,
                         help="observe from as far as the 3D range allows at the scout's altitude "
                              "(~125 m at 70 m) instead of the kit's 100 m (default: on)")
+    parser.add_argument("--column-lns", action="store_true",
+                        help="LNS also swaps whole scout tours for tours from the joint planner's "
+                             "pool (column_lns.py; experimental)")
     parser.add_argument("--artifacts", type=Path,
                         help="optional directory for ranked plans, tree.json and interactive tree.html")
     args = parser.parse_args()
@@ -61,7 +66,11 @@ def main():
     if not 0 <= args.lns_share <= 1:
         parser.error("lns-share must be 0..1")
     scenario = Scenario.from_dict(load_json(args.scenario))
-    search = Search(scenario, args.seconds, args.top_n, args.beam_width, START, args.lns_share,
+    if args.column_lns:
+        from column_lns import ColumnSearch as SearchClass
+    else:
+        SearchClass = Search
+    search = SearchClass(scenario, args.seconds, args.top_n, args.beam_width, START, args.lns_share,
                     args.interleave, args.adaptive, args.restarts,
                     scout_speed=args.scout_speed, obs_stretch=args.obs_stretch)
     verified = search.run()
