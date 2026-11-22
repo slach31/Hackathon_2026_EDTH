@@ -5,7 +5,7 @@ The team implementation is at this repository's root. The bundled `AA-Hackathon-
 ## Planner constraints
 
 - Python 3.9+ and the standard library only. The official runner supplies `fleetkit` through `PYTHONPATH`; local discovery also supports `FLEETKIT_DIR`.
-- The complete planner process has 60 seconds. The current default search deadline is 55 seconds from startup; preserve time for full official validation and output. See PLAN.md for the proposed larger safety margin.
+- The complete planner process has 60 seconds. The default search deadline is 50 seconds from startup (capped at 55); preserve time for full official validation and output. At 55 s, L4 runs reached 57-58 s of wall time under CPU load.
 - The official score is contact points minus energy and consumed-effector penalties. Higher is better. Invalid plans, crashes and timeouts score zero.
 - The assignment matrix ranks estimated aircraft/contact costs. Timed waypoints represent aircraft motion. Estimated matrix feasibility is not proof that a fleet plan is valid.
 - When replacing routes, check separation for every pair involving a changed route. Recheck confirmation and strike completeness globally; a rebuilt scout tour can break earlier confirmations. Fully validate exported winners with the official scorer.

@@ -8,7 +8,7 @@ Run from this directory:
 python3 planner.py path/to/scenario.json output/plan.json
 ```
 
-The default search deadline is **55 seconds from startup**, including input loading. This leaves time inside the organisers' 60-second limit for full validation and writing the result. The required plan is written before optional diagnostics. Python imports and individual validator calls cannot be preempted: this is a cooperative deadline, not a guarantee against arbitrary machine stalls.
+The default search deadline is **50 seconds from startup** (capped at 55), including input loading. This leaves about 10 seconds inside the organisers' 60-second limit for full validation and writing the result; at 55 s, L4 runs reached 57-58 s of wall time under CPU load. The required plan is written before optional diagnostics. Python imports and individual validator calls cannot be preempted: this is a cooperative deadline, not a guarantee against arbitrary machine stalls.
 
 For a shorter run with five candidate plans and the tree:
 
@@ -57,7 +57,132 @@ Each node holds routes, scout tasks, consumed effectors and a score. At each con
 - When the beam phase ends, a greedy **repair** pass fills the best plan: unserved unknowns, then hostiles, are inserted at the cheapest scout-tour positions with the free effectors (at most 0.25 s per contact and a quarter of the LNS share). LNS then starts from the best archived plan.
 - Route builders reuse memoised zone detours, and candidates whose waypoints fall outside the horizon or a contact's window are rejected before parsing. Duplicate plans are detected from per-route waypoint tuples.
 - The last `--lns-share` of the budget (default 0.4) runs LNS on the best plan. Each iteration removes 1–4 served contacts, chosen at random or as neighbours of a random contact, rebuilding the affected scout tour from its original departure. It then tries to reinsert the removed contacts, their six nearest unserved neighbours and three random unserved contacts. Each scout visit is tried at the three cheapest tour positions (added distance), and the best valid child per contact is kept. Worse plans are sometimes accepted, with a temperature of 1% of the best score falling to zero. After 25 iterations without a new best, the search restarts from a random plan in the top-N archive (`--no-restarts` returns to the best plan instead) and stops after 400 iterations without a new best. Accepted plans enter the archive, so they receive the same final official validation.
-- Expansion has local time caps, preventing an impossible contact from consuming the whole run. Children must improve the parent's actual score. All archive winners receive a full official validation and score before export; final validation stops starting new calls at 58 seconds. The valid empty plan is the last fallback.
+- Expansion has local time caps, preventing an impossible contact from consuming the whole run. Children must improve the parent's actual score. All archive winners receive a full official validation and score before export; final validation stops starting new calls 3 seconds after the search deadline. The valid empty plan is the last fallback.
+
+## Planner v2 (21 Nov): low flight, joint scouts, faster checks
+
+v2 keeps the tree search above and adds new route shapes, a joint scout planner and faster validation. Every plan is still checked by the official validator before it is written.
+
+### Results
+
+Single runs of the hand-in planner on the 8 public validation scenarios, run the way `submit_to_board.py` runs them (one at a time, official scorer):
+
+| Scenario | Original planner (55 s) | v2 before the joint planner (50 s) | **v2 (50 s)** |
+|---|---|---|---|
+| L1-101 | 68.26 | 72.29 | 69.38 |
+| L2-201 | 288.35 | 297.60 | 293.15 |
+| L2-202 | 257.84 | 257.54 | 261.05 |
+| L3-301 | 693.50 | 713.87 | 717.56 |
+| L3-302 | 393.41 | 401.67 | 409.49 |
+| L3-303 | 420.05 | 439.73 | 446.00 |
+| L4-401 | 1,452.73 | 1,575.49 | 1,632.55 |
+| L4-402 | 937.06 | 1,123.90 | 1,156.38 |
+| **Total** | **4,511.19** | **4,882.08** | **4,985.55** |
+
+All 24 plans were valid. The slowest v2 run took 50.6 s of wall time; the original planner took up to 60.0 s on L4-401.
+
+On 13 cases (the 8 above plus generated seeds L3:1 and L4:0–3), 55 s, three benchmarks in parallel, v2 before the joint planner scored **9,974.49** against **9,127.90** for the original planner (+9.3%). It won all 13 cases, and every plan was valid. Single L4 runs vary by about ±50 points between runs, so compare totals, not single cases.
+
+### How one run works
+
+Each step produces complete plans and puts them in one shared archive, ranked by score. The steps compete: the improvement step works on whichever plan is best so far, whatever produced it.
+
+| Step | Algorithm | Time |
+|---|---|---|
+| 1. Warm start | the kit's greedy baseline, with faster checks | up to 25% of the budget (max 10 s) |
+| 2. Joint scout planner | randomised nearest-neighbour scout tours, the best set chosen jointly, up to 3 candidates built with strikes | 85% of the beam phase (stops early when it converges) |
+| 3. Sector construction | far anchor contacts on different bearings, one scout each | off since 22 Nov (`CONSTRUCT_SHARE = 0`) |
+| 4. Beam search | contact-by-contact serve/skip tree (above) | rest of the beam phase |
+| 5. Improvement | cleanup, re-fly, idle-scout tours, greedy repair, then LNS | `--lns-share` of the budget (default 0.4) |
+| 6. Polish and output | cleanup and re-fly of the 3 best plans, official validation, write | last 0.4 s, then up to 3 s |
+
+### Low flight: cheaper routes within the rules
+
+The kit's route builders climb to a cruise layer (effectors 40/85/130 m, scouts 70/110 m), hover straight up and down, and fly at 95% of top speed. The rules require less:
+
+- **R2 checks altitude only at waypoints**, and the last waypoint of a route may be at 0 m. A strike route therefore flies from the pad straight to the engagement point, which is the contact at ground level (within R_eng = 25 m, so R10 holds). Detour points around zones fly at 32 m, because every waypoint except the last needs z ≥ z_min (30 m).
+- **A leg's minimum duration is max(horizontal / v_h, vertical / climb rate)**, so climbing and cruising overlap. Scouts climb on the way to their first observation and descend on the way home, without hovering.
+- **Scouts observe from 30.5 m.** The 3D observation range (150 m) then allows about 147 m horizontally, against about 133 m at 70 m. The validator checks the 3D distance at the waypoint (+1e-6), so a 5 cm margin covers waypoint rounding (1 mm).
+- **Scouts cruise at 99.8% of v_h**, plus 0.01 s per leg for rounding. R2 allows v_h exactly. The last 2% decides whether some early-window contacts about 5 km out can still be confirmed.
+- **Effectors cruise at their best-range speed**, sqrt(p0 / k_v), capped at v_h. Energy per metre is lowest there.
+
+On L1-101 this alone took the same plan from 68.26 to 71.86: 16.3 Wh of energy instead of 23.5 Wh. A low route can still conflict with other aircraft (R8), so strikes try, in order:
+1. the direct low route;
+2. a low route crossing at 72 m, which is above scouts at 30.5 m by more than d_sep, then diving over the last 150 m;
+3. the kit's layered routes.
+
+The re-fly pass rebuilds existing routes with these profiles, one route at a time. It keeps a change only if the plan stays valid and scores higher. It also tries arrival shifts of ±3 and ±7 s within the team's 20 s sync window.
+
+### Joint scout planner (nearest neighbour)
+
+In L4 the scouts are the bottleneck. All 15 share one base, fly about 16 m/s, and have 27–49 Wh of battery against a 900 s horizon. Most contacts are 5–8 km out, so each scout gets roughly one trip. Which scout takes which chain of contacts decides most of the score, and adding contacts one at a time (beam, LNS) fixes that choice too early.
+
+The joint planner decides all scout tours together:
+
+1. **Ranges.** For each scout, the farthest out-and-back distance its battery and the horizon allow at its own speed and power. From that, the scouts able to serve each contact alone: observation done in time, for hostiles 10 s before the window closes (R4), and home again.
+2. **Complete plans by randomised nearest-neighbour insertion.** Scouts are taken in a random order (the longest range first in the first restart). Each grows a tour from contacts nobody has taken yet. The next contact is the one with the best value per added kilometre, with ±50% noise, at its cheapest insertion position. A contact is kept only if it adds value net of the scout's energy. A tour must:
+   - fit the battery and end 20 s before the horizon, so it can still be delayed at take-off against R8;
+   - leave every hostile time for a strike: effectors able to arrive after the observation, plus the confirm margin, plus the team's 5 s spacing, before the window closes;
+   - stay within the effector supply.
+   
+   Hundreds of restarts run in the time given (about 290–560 on L4).
+3. **Joint selection.** All tours generated form a pool. The planner picks at most one tour per scout, with no contact twice and within the effector supply, maximising total estimated value: randomised greedy picks plus swap improvements, against the best single restart.
+4. **Build.** The chosen tours are added most valuable first. Each tries altitude layers 30.5, 70.5 and 110.5 m (40 m apart, so scouts on different layers cannot break R8) and take-off delays of 0–50 s. Strikes come next, using the normal strike builder. A greedy repair then offers the contacts of tours that did not fit to any scout.
+
+On its own, in about 15 s, it built 1,114 on L4-402 and 1,585 on L4-401: as much as the whole previous planner in 50 s.
+
+**Time split (22 Nov).** In L4 the beam's plans never won: the winning plan's lineage always started from the joint planner, and the beam got only 2–3 passes. The joint planner now gets 85% of the beam phase, and the sector construction is off (`CONSTRUCT_SHARE = 0`). On small scenarios the joint planner stops early after 150 restarts without a better plan (`JOINT_PATIENCE`), leaving the time to the beam. Over 3 runs per side at 50 s: L4-401 1,595.6 → 1,613.3 on average, L4-402 1,075.3 → 1,120.3. L3-303 and L2-201 were unchanged.
+
+**Several builds (22 Nov).** The estimate of a joint plan misses take-off conflicts and strike timing by 50–150 points on L4, by different amounts per plan. The planner now builds up to 3 distinct candidate plans (`JOINT_BUILDS`): the selection result and the best restarts. The top candidate is always built fully; the others only use leftover time. The best built plan is kept. Over 3 runs per side: L4-402 1,131.7 → 1,140.9, L4-401 unchanged (1,618.5 against 1,617.0). Splitting the build time equally between the candidates instead caused a 1,440 outlier on L4-401, because no build finished its strikes.
+
+### Other new steps
+
+- **Range-aware scout choice.** When a contact goes to an idle scout, the smallest scout that can still serve it is used. This keeps long-range scouts free for contacts only they reach. Before, the choice among idle scouts depended on which pad was a few metres closer.
+- **No repeat observations.** A hostile that some scout already observes is first struck from that observation, and a tour never gets a second visit to the same contact. The current plans had 2–4 such repeats per L4, each costing at least 20 s of a scout's only trip.
+- **Cleanup (prune).** Drops scout visits that serve nothing (repeats, or hostiles never struck) when the rebuilt tour keeps every served contact and scores higher.
+- **Idle-scout tours.** After the beam, each idle scout grows its own greedy tour over what is still unserved.
+- **Scout rebuild in LNS.** In 10% of iterations, 1–3 scout tours are cleared together and regrown from anchors few scouts can reach.
+
+### Faster validation (same verdicts)
+
+The incremental checker (`IncrementalValidator`) is about 2× faster and gives the same verdicts as the official validator:
+
+- **Per-route rules are cached.** R1, R2, R3, R5, R6, R7 and R9 look at one route at a time, so each distinct route is checked once, along with its parse, separation data and energy. Before, the same scout route was re-checked for every strike variant built on it.
+- **R4 and R10 are rechecked only for affected contacts.** These are contacts touched by a changed or removed route; the check covers every route that touches them. The parent plan was valid for every other contact.
+- **Separation pairs that are provably far apart are skipped.** If two flight pieces' bounding boxes, or their closest approach over the shared time, stay at least d_sep + 1 cm apart, the official check cannot find a violation. Every other pair goes to `separation_violation`.
+
+Checked by comparing every verdict during real L2–L4 searches with the official `evaluate()`: about 28,000 verdicts, 0 mismatches and 0 score differences. `tests/test_search.py` (`ScoutTourTests`) repeats this on a smaller sample.
+
+### Timing
+
+The default deadline is now 50 s (it was 55 s). At 55 s, L4 runs reached 57–58 s of wall time while other processes loaded the CPU. Under the same load at 50 s, the slowest run took 51.2 s. The run can still overrun briefly when the operating system stalls the process: gaps of 0.8–2 s between deadline checks were observed a few times. Large caches now evict their oldest 10% instead of clearing all at once.
+
+### What did not help
+
+- **Parallel searches inside the hand-in** (one search per CPU core, best plan wins). On a 2-performance-core, 8-efficiency-core laptop, total search effort stopped growing at 8 processes (2.5× one process). 12 processes overran a 15 s budget by 2.5 s. With an unknown grading machine, the risk outweighs the gain. The same idea works well offline for the board (below).
+- **Better observation points, scout tour swaps, slower flight while waiting for windows.** Measured on the best plans: about 4, 15 and 1 points in total.
+- **Scout-rebuild LNS as the main move.** Clearing whole tours makes a packed plan much worse, and no regrow recovered it: 7 rebuilds accepted out of about 160, with changes of −3 to +4 points. Adding a full repair after each rebuild halved the LNS iterations for no gain. The move is kept at 10% of iterations.
+- **Less LNS in favour of the joint planner and beam.** With `--lns-share 0.1`, the 8 public scenarios scored 4,908.21, against 4,985.55 with the default 0.4. L1–L3 were unchanged (2,196.19 against 2,196.63); L4 lost 77 points (1,580.57 and 1,131.45 against 1,632.55 and 1,156.38). The joint planner finds the scout assignment, and LNS then tunes the details.
+- **Tested on 22 Nov, not adopted.** Each was compared over 3 runs per side on L4-401 and L4-402 at 50 s; single L4 runs vary by about ±50 points, so differences below ~20 points are noise.
+  - Strike costs without the 40 m climb in `CandidateMatrix`: L4-401 −37.5, L4-402 +6.5.
+  - LNS share 0.2 instead of 0.4 with the joint-heavy split: +1.4 and −16.6.
+  - Observation points facing the tour's neighbours instead of home: −12.6 and +5.6.
+  - Wider tour generation (10 candidate contacts, 5 insertion positions): +17.8 and −9.2.
+  - Validating every tour during joint restarts (R8 against the restart's other scouts): the 8 public scenarios fell from 4,985.55 to 4,883.49, because restarts dropped from about 560 to about 50 on L4-402.
+  - Column-swap LNS (`column_lns.py`, opt-in `--column-lns`): swaps whole scout tours for pool tours. About 240 swaps were tried, 5 accepted and 1 improved; results moved −36 and +44 from scratch.
+- **Which hostiles to serve.** An exact knapsack over the effector supply (lights and heavies) picks the same hostiles as the planner on all L2 and L3 scenarios, and differs by 7 and 26 points on the two L4s. On L2/L3 the remaining gap is costs: effectors are within 2–4 points of their one-way minimum per scenario.
+- **Early-window hostiles about 5 km out** (for example L4-402's C01, C43 and C07). A scout can now observe them in time, but R4 needs the observation finished 10 s before the strike, which they miss by 3–8 s.
+
+### Offline board search
+
+The live board accepts plans, not code, and keeps each team's best score per scenario. `analysis/board_search.py` runs many long searches per scenario in parallel. Half start from the best plan so far, half from scratch with other random seeds. A plan replaces `output/board-best/<scenario>.json` only if the official scorer rates it higher. It does not change the hand-in planner.
+
+```sh
+python3 analysis/board_search.py --scenarios L4-401 L4-402 --runs 8 --seconds 240 --workers 8
+python3 -m fleetkit submit-all output/board-best
+```
+
+Change `--first-variant` between invocations to explore new random seeds. The board is a validation set; the final ranking runs `planner.py` on unseen scenarios with 60 s, so only changes to the hand-in planner count there.
 
 The result is the best N plans **found**, not a proof of the global top N. Contact ordering, a bounded beam, fixed flight settings, shortlists and the improving-child restriction can all discard useful alternatives. The trace records accepted nodes and skip branches; failed route attempts are aggregated by rule, rather than stored individually. Trace growth is capped between passes to keep tiny scenarios from producing unlimited diagnostics.
 
