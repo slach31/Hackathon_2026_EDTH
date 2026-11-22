@@ -201,21 +201,21 @@ The packing picks one combination of trips by estimated value, and only that one
 - one depth per scout, scouts with the most valuable packed trip first;
 - each node's children are the scout's best trips that are disjoint from the node's contacts. These are ranked by trip value plus a greedy estimate for the remaining scouts. The packed trip and "no trip" are always options;
 - each child is realised through `_serve` (strikes included) and incrementally validated. The beam (`TRIP_TREE_WIDTH` 6, `TRIP_TREE_BRANCH` 5) ranks nodes by real score plus the remaining-scout estimate, scaled by the packing's realised/estimated ratio;
-- it is anytime: each depth gets an equal share of the remaining time, and options are tried round-robin across the beam, so a complete plan is always reached. The best of the tree and the realised packing is repaired as before. The warm-start share is `TRIP_TREE_SHARE` (45% of the beam phase).
+- it is anytime: each depth gets an equal share of the remaining time, and options are tried round-robin across the beam, so a complete plan is always reached. The best of the tree and the realised packing is repaired as before. Trip generation, the packing and the tree share `TRIP_TREE_SHARE`, 20% of the whole budget. This window may run past the end of the beam phase, taking the time from LNS. With the default LNS share of 0.75, a share of the beam phase left the tree 0.2–0.4 s on L4-401 under load. It then stopped at depth 1–3 and went unused.
 
 Every node is a valid plan with an official score, and node validation is cheap because `route_info` and R8 pair results are memoised across siblings. A full tree on L4 costs about 3.5 s, about 230 realised nodes. Stats are in `trip_plan.tree`.
 
 The first version kept only each scout's top 20 trips. Those overlap the contacts earlier scouts had already taken, so the estimate collapsed to zero and the beam collapsed to 3 nodes. A fixed-width version without time shares reached only depth 5 of 15 under load and lost 25 points on L4-401.
 
-Same-run comparison, 12 concurrent planners on 12 cores, default 45 s, all plans valid. "Off" is the same code with `TRIP_TREE = False`:
+Same-run comparisons, 12 concurrent planners on 12 cores, default 45 s, all plans valid. "Off" is the same code with `TRIP_TREE = False`:
 
-| Case | off | tree | Δ |
-|---|---:|---:|---:|
-| L4-401 (6 off / 3 tree runs) | 1577.3 | 1600.0 | +22.7 |
-| L4-402 (6 / 3) | 1136.0 | 1147.4 | +11.4 |
-| L1–L3 board cases, 1 run each | 2215.4 | 2213.4 | −1.9 |
+| Case | LNS 0.4: off | LNS 0.4: tree | Δ | LNS 0.75: off | LNS 0.75: tree | Δ |
+|---|---:|---:|---:|---:|---:|---:|
+| L4-401 (6 off / 3 tree runs) | 1577.3 | 1600.0 | +22.7 | 1568.0 | 1586.5 | +18.5 |
+| L4-402 (6 / 3) | 1136.0 | 1147.4 | +11.4 | 1157.0 | 1164.1 | +7.1 |
+| L1–L3 board cases, 1 run each | 2215.4 | 2213.4 | −1.9 | 2218.9 | 2222.4 | +3.5 |
 
-Run-to-run spread on L4 is about ±30, so the L4-402 gain and the L1–L3 difference are within noise.
+Before LNS, the tree beat the realised packing in every 0.75 run: +11 to +48 on L4-401 and +111 to +178 on L4-402. LNS recovers much of that difference. Run-to-run spread on L4 is about ±30, so the L4-402 gains and the L1–L3 differences are within noise.
 
 #### Joint re-plan of n scouts (LNS operator `group`)
 

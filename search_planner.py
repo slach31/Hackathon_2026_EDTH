@@ -804,7 +804,7 @@ TRIP_TREE = True
 TRIP_TREE_WIDTH = 6      # nodes kept per depth
 TRIP_TREE_BRANCH = 5     # trips tried per node (plus the packed trip and "no trip")
 TRIP_TREE_POOL = 30      # a scout's best disjoint trips ranked for branching
-TRIP_TREE_SHARE = 0.45   # warm-start share of the beam phase when the tree is on
+TRIP_TREE_SHARE = 0.2    # trip plan + tree share of the whole budget (may pass beam_stop)
 
 
 def pack_trips(trips, stop=None):
@@ -1808,12 +1808,20 @@ class Search:
         rng = random.Random(self.sc.seed)
         self.checker.stop = min(self.beam_stop, self.stop)
         if TRIP_PLAN and contacts:
-            share = ((TRIP_TREE_SHARE if TRIP_TREE else TRIP_PLAN_SHARE)
-                     * max(0.0, self.beam_stop - self.start))
+            if TRIP_TREE:
+                # A share of the whole budget: the tree may run past the beam phase
+                # (its time then comes out of LNS), never past the search deadline.
+                trip_stop = min(self.stop, time.monotonic()
+                                + TRIP_TREE_SHARE * max(0.0, self.stop - self.start))
+                self.checker.stop = max(self.checker.stop, trip_stop)
+            else:
+                trip_stop = min(self.checker.stop, time.monotonic()
+                                + TRIP_PLAN_SHARE * max(0.0, self.beam_stop - self.start))
             try:
-                self.trip_plan(min(self.checker.stop, time.monotonic() + share))
+                self.trip_plan(trip_stop)
             except DeadlineReached:
                 pass
+            self.checker.stop = min(self.beam_stop, self.stop)
         try:
             self.search(contacts, priorities, rng)
         except DeadlineReached:
